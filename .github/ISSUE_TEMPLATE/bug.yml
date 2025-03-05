@@ -1,0 +1,25 @@
+name: Bug Report
+description: Report strategy or implementation issues
+title: "[Bug]: "
+labels: ["bug"]
+assignees:
+  - lrud
+body:
+  - type: dropdown
+    id: component
+    attributes:
+      label: Component
+      options:
+        - VPOC Analysis
+        - Strategy Logic
+        - Backtest Engine
+        - Performance Metrics
+    validations:
+      required: true
+  - type: textarea
+    id: description
+    attributes:
+      label: Issue Description
+      placeholder: Describe what's not working as expected
+    validations:
+      required: true

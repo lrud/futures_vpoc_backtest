@@ -1,0 +1,21 @@
+name: Strategy Enhancement
+description: Template for strategy improvements
+title: "[Enhancement]: "
+labels: ["enhancement"]
+assignees:
+  - lrud
+body:
+  - type: markdown
+    attributes:
+      value: "## Strategy Enhancement Details"
+  - type: dropdown
+    id: category
+    attributes:
+      label: Enhancement Category
+      options:
+        - ML Feature Engineering
+        - Testing Framework
+        - Performance Metrics
+        - Documentation
+    validations:
+      required: true
