@@ -54,14 +54,18 @@ Advanced algorithmic trading strategy for E-mini S&P 500 (ES) futures that combi
 ```
 futures_vpoc_backtest/
 ├── NOTEBOOKS/              # Core implementation
-│   ├── VPOC.py            # Volume profile analysis
-│   ├── STRATEGY.py        # Signal generation engine
-│   ├── BACKTEST.py        # Performance evaluation
-│   ├── MATH.py           # Statistical analysis tools
-│   └── DATA_LOADER.py    # Data preprocessing pipeline
-└── DATA/                  # Market data storage
-    ├── RAW/              # Original price data
-    └── CLEANED/          # Processed datasets
+│   ├── VPOC.py            # Volume profile analysis & calculations
+│   ├── STRATEGY.py        # Trading signal generation
+│   ├── BACKTEST.py        # Performance testing & risk management
+│   ├── MATH.py            # Statistical validation tools
+│   └── DATA_LOADER.py     # Data preprocessing utilities
+└── .gitignore             # Git ignore rules
+
+Required Data Structure (not included):
+- Minute-level ES futures data
+- Columns: timestamp, open, high, low, close, volume
+- Format: CSV with headers
+- Date range: 2021-12-05 to 2025-02-27
 ```
 
 ## Installation & Usage
