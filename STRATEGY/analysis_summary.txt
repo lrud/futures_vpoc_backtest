@@ -1,0 +1,28 @@
+ES Futures Strategy Analysis Summary
+===================================
+
+Date Range: 2021-12-05 to 2025-02-27
+Total Sessions: 1064
+Contracts: ES_03_22, ES 06-22, ES 09-22, ES 12-22, ES 03-23, ES 06-23, ES 09-23, ES 12-23, ES 03-24, ES 06-24, ES 09-24, ES 12-24, ES 03-25
+
+Gap Analysis:
+  - Total Gaps: 458
+  - 1st Hour Fill Rate: 4.1%
+
+VPOC Trend Analysis:
+  - Current Trend: down
+  - Confidence: 32.2%
+
+Trading Signals:
+  - Total Signals Generated: 1068
+  - Long Signals: 604
+  - Short Signals: 464
+  - VPOC-Only Signals: 893
+  - Confirmed Signals: 175
+
+Most Recent Signal (2025-02-27 00:00:00):
+  SELL @ 6003.25
+  Stop Loss: 6025.25
+  Target: 5959.25
+  Reason: HTF Bias DOWN + Falling VPOC + Entry at Value Area High
+  Type: VPOC-Only

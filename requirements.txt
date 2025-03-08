@@ -1,0 +1,23 @@
+# Data Analysis
+pandas
+numpy
+
+# Scientific Computing
+scipy
+
+# Visualization
+matplotlib
+seaborn
+
+# Data Processing
+pytz
+python-dateutil
+
+# Technical Analysis
+pandas-ta
+
+# Statistics
+statsmodels
+
+# File Handling
+openpyxl

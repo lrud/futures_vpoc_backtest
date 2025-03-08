@@ -1,0 +1,12 @@
+.git
+__pycache__/
+*.py[cod]
+*$py.class
+.env
+.venv
+env/
+venv/
+ENV/
+*.so
+.Python
+.ipynb_checkpoints

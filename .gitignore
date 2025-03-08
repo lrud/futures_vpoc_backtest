@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+.venv/
+my_venv/
+build/
+develop-eggs/
+dist/
+eggs/
+*.egg-info/
+
+# Jupyter Notebooks
+*.ipynb
+.ipynb_checkpoints/
+NOTEBOOKS/**/*.ipynb
+
+# Data and Results
+DATA/
+CLEANED/
+RAW/
+TRAINING/
+*.csv
+*.xlsx
+*.xls
+*.parquet
+*.h5
+*.pkl
+*.pth
+*.pt
+*.model
+*.weights
+
+# IDE
+.vscode/
+.idea/
+
+# Environment
+.env
+venv/
