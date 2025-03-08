@@ -1,5 +1,5 @@
 # Python
-__pycache__/
+**pycache**/
 *.py[cod]
 *$py.class
 *.so
@@ -22,16 +22,28 @@ DATA/
 CLEANED/
 RAW/
 TRAINING/
+RESULTS/
+results/
+BACKTEST/
+backtest/
 *.csv
 *.xlsx
 *.xls
 *.parquet
 *.h5
 *.pkl
+
+# ML Training Specific
 *.pth
 *.pt
 *.model
 *.weights
+
+# Images
+*.png
+*.jpg
+*.jpeg
+*.gif
 
 # IDE
 .vscode/
