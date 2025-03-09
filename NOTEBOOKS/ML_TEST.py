@@ -68,18 +68,18 @@ class AMDOptimizedFuturesModel(nn.Module):
         # Add layer norm before output for better stability
         self.final_norm = nn.LayerNorm(hidden_layers[-1])
 
-def forward(self, x):
-    x = self.input_layer(x)
-    x = F.silu(x)  # Apply activation to input layer
-    
-    # Efficient layer traversal
-    for layer in self.hidden_layers:
-        x = layer(x)
-    
-    # Apply final normalization
-    x = self.final_norm(x)
-    
-    return self.output_layer(x)
+    def forward(self, x):
+        x = self.input_layer(x)
+        x = F.silu(x)  # Apply activation to input layer
+        
+        # Efficient layer traversal
+        for layer in self.hidden_layers:
+            x = layer(x)
+        
+        # Apply final normalization
+        x = self.final_norm(x)
+        
+        return self.output_layer(x)
 
 class AMDFuturesTensorParallel:
     """

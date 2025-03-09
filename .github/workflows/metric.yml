@@ -14,5 +14,4 @@ jobs:
         uses: actions/setup-python@v2
         with:
           python-version: '3.8'
-      - name: Update Metrics
-        run: python NOTEBOOKS/update_metrics.py
+      
