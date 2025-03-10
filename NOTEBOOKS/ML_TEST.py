@@ -35,7 +35,7 @@ class AMDOptimizedFuturesModel(nn.Module):
     Advanced Neural Network Optimized for AMD 7900 XT GPUs
     Leveraging ROCm-specific performance characteristics
     """
-    def __init__(self, input_dim, hidden_layers=[256, 128, 64], dropout_rate=0.3):
+    def __init__(self, input_dim, hidden_layers=[64, 32], dropout_rate=0.4):
         super().__init__()
         
         # Input layer with adaptive initialization
@@ -346,14 +346,64 @@ class AMDFuturesTensorParallel:
         
         return augmented_df
     
+    def select_important_features(self, X, y, max_features=15):
+        """
+        Select most important features using statistical methods.
+        
+        Parameters:
+        -----------
+        X : numpy.ndarray
+            Feature matrix
+        y : numpy.ndarray
+            Target values
+        max_features : int
+            Maximum number of features to select
+            
+        Returns:
+        --------
+        tuple
+            (selected_features_array, selected_feature_names)
+        """
+        print(f"Performing feature selection to select top {max_features} features...")
+        
+        from sklearn.feature_selection import SelectKBest, f_regression
+        
+        # Use F-regression to select features most correlated with target
+        selector = SelectKBest(f_regression, k=max_features)
+        X_selected = selector.fit_transform(X, y)
+        
+        # Get selected feature indices
+        selected_indices = selector.get_support(indices=True)
+        selected_features = [self.feature_columns[i] for i in selected_indices]
+        
+        # Calculate and display F-scores for selected features
+        f_scores = selector.scores_
+        selected_f_scores = [(self.feature_columns[i], f_scores[i]) for i in selected_indices]
+        selected_f_scores.sort(key=lambda x: x[1], reverse=True)
+        
+        print("\nSelected features with F-scores:")
+        for feature, score in selected_f_scores:
+            print(f"  {feature}: {score:.4f}")
+        
+        return X_selected, selected_features
+
     def train_ddp(self, 
                 num_epochs=50, 
                 batch_size=64, 
-                learning_rate=1e-3):
+                learning_rate=1e-3,
+                use_feature_selection=True,
+                max_features=15):
         """
         Launch training with Distributed Data Parallel and ROCm optimizations
         """
         print("[Checkpoint] Starting DDP training")
+        
+        # Feature selection (new code)
+        if use_feature_selection:
+            X_selected, selected_feature_columns = self.select_important_features(self.X, self.y, max_features=max_features)
+            self.X = X_selected  # Use selected features for training
+            self.feature_columns = selected_feature_columns  # Update feature columns list
+            print(f"Training with {len(self.feature_columns)} selected features (reduced from {self.X.shape[1]})")
         
         # Distribute training across available GPUs
         world_size = min(self.num_gpus, 2)
@@ -444,7 +494,7 @@ class AMDFuturesTensorParallel:
             optimizer = optim.AdamW(
                 ddp_model.parameters(), 
                 lr=learning_rate,
-                weight_decay=1e-5,
+                weight_decay=1e-4,
                 eps=1e-8
             )
             
@@ -500,16 +550,17 @@ class AMDFuturesTensorParallel:
                     }, checkpoint_path)
                     print(f"[Checkpoint] Saved model at epoch {epoch} to {checkpoint_path}")
             
-            # Save final model on main process
-            if local_rank == 0:
-                print("[Checkpoint] Training complete, saving final model")
-                final_model_path = os.path.join(PROJECT_ROOT, "TRAINING", "es_futures_model_final.pt")
-                torch.save({
-                    'model_state_dict': ddp_model.module.state_dict(),  # Save the inner model
-                    'feature_columns': self.feature_columns if hasattr(self, 'feature_columns') else None,
-                    'scaler': scaler,
-                }, final_model_path)
-            
+           # Save final model on main process
+                if local_rank == 0:
+                    print("[Checkpoint] Training complete, saving final model")
+                    final_model_path = os.path.join(PROJECT_ROOT, "TRAINING", "es_futures_model_final.pt")
+                    torch.save({
+                        'model_state_dict': ddp_model.module.state_dict(),  # Save the inner model
+                        'feature_columns': self.feature_columns if hasattr(self, 'feature_columns') else None,
+                        'epoch': epoch,
+                        'loss': loss.item(),
+                    }, final_model_path)
+
         except Exception as e:
             print(f"[ERROR] Worker {local_rank} failed with exception: {e}")
             import traceback
@@ -538,12 +589,14 @@ def main():
         contract='ES'
     )
     
-    # Start training
-    print("[Checkpoint] Starting tensor parallel training")
+    # Start training with feature selection and reduced complexity
+    print("[Checkpoint] Starting tensor parallel training with feature selection")
     predictor.train_ddp(
         num_epochs=50,
         batch_size=64,
-        learning_rate=1e-3
+        learning_rate=1e-3,
+        use_feature_selection=True,  # Enable feature selection
+        max_features=15              # Use top 15 features
     )
     
     print("[Checkpoint] Execution complete")
