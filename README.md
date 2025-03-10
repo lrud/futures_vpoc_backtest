@@ -3,13 +3,26 @@
 ## Overview
 Advanced algorithmic trading strategy for E-mini S&P 500 (ES) futures that combines Volume Point of Control (VPOC) analysis with statistical validation. The strategy identifies high-probability trading opportunities by analyzing volume distribution patterns, value area migrations, and market microstructure.
 
-## Strategy Performance (March 5, 2025)
+## Strategy Performance (March 10, 2025)
+
+### Original VPOC Strategy
 - **Total Trades**: 1,649
-- **Win Rate**: 73.32%
-- **Total Profit**: $192,746.43
+- **Win Rate**: 73.38%
+- **Total Profit**: $192,624.83
 - **Profit Factor**: 3.04
-- **Sharpe Ratio**: 5.32
+- **Sharpe Ratio**: 5.31
 - **Max Drawdown**: -1.00%
+
+### ML-Enhanced Strategy
+- **Total Trades**: 143
+- **Win Rate**: 56.64%
+- **Total Profit**: $44,116.45
+- **Average Profit Per Trade**: $308.51 (vs $116.81 for original)
+- **Profit Factor**: 2.34
+- **Sharpe Ratio**: 4.52
+- **Max Drawdown**: -3.60%
+
+![Strategy Comparison](strategy_comparison.png)
 
 ## Strategy Components
 
@@ -19,6 +32,17 @@ Advanced algorithmic trading strategy for E-mini S&P 500 (ES) futures that combi
 - Determines Value Area (70% of volume) boundaries
 - Tracks VPOC migrations to identify institutional price acceptance
 
+### Machine Learning Enhancement
+- **Neural Network Architecture**: Optimized for AMD GPUs with SiLU activation
+- **Feature Engineering**: Comprehensive feature set including:
+  - Price momentum (10, 20, 50-day windows)
+  - Volatility metrics
+  - Volume trends
+  - VPOC migrations
+  - Range evolution
+- **Signal Generation**: ML-filtered signals with confidence thresholds
+- **Performance**: Higher per-trade profitability with more selective entry criteria
+
 ### Trade Setup Requirements
 - **Long Entries**:
   - Price testing Value Area Low (VAL)
@@ -26,21 +50,23 @@ Advanced algorithmic trading strategy for E-mini S&P 500 (ES) futures that combi
   - Strong statistical validation (R² >0.69)
   - Higher timeframe momentum aligned (Bayesian prob >53%)
   - Volume profile showing accumulation pattern
+  - ML confidence score above threshold (for ML strategy)
 
-  - **Short Entries**:
+- **Short Entries**:
   - Price testing Value Area High (VAH)
   - Mirror conditions of long entries
   - Additional validation through volatility windows
   - Institutional selling pressure confirmed
+  - ML confidence score above threshold (for ML strategy)
 
-### 3. Risk Management
+### Risk Management
 - Position sizing based on account volatility
 - Dynamic stops using ATR and value area boundaries
 - Maximum exposure limits per trade
 - Multiple timeframe validation
 - Capital preservation rules
 
-### 4. Mathematical Validation
+### Mathematical Validation
 - **Trend Analysis**: Slope 2.47, R² 0.69
 - **Volatility Windows**:
   - 10-day: 71.97
@@ -53,12 +79,14 @@ Advanced algorithmic trading strategy for E-mini S&P 500 (ES) futures that combi
 ## Project Structure
 ```
 futures_vpoc_backtest/
-├── NOTEBOOKS/              # Core implementation
+├── NOTEBOOKS/             # Core implementation
 │   ├── VPOC.py            # Volume profile analysis & calculations
 │   ├── STRATEGY.py        # Trading signal generation
 │   ├── BACKTEST.py        # Performance testing & risk management
 │   ├── MATH.py            # Statistical validation tools
-│   └── DATA_LOADER.py     # Data preprocessing utilities
+│   ├── DATA_LOADER.py     # Data preprocessing utilities
+│   ├── ML_TEST.py         # ML model architecture and training
+│   └── ML_BACKTEST.py     # ML-enhanced backtesting framework
 └── .gitignore             # Git ignore rules
 
 Required Data Structure (not included):
