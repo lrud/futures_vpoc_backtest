@@ -78,6 +78,7 @@ Advanced algorithmic trading strategy for E-mini S&P 500 (ES) futures that combi
   - Downward: 46.53%
 
 ## Project Structure
+```text
 futures_vpoc_backtest/
 ├── src/                    # Refactored, modular implementation
 │   ├── analysis/           # Analysis components
@@ -118,7 +119,7 @@ futures_vpoc_backtest/
 ├── DATA/                  # Data directory (not included in repo)
 ├── TRAINING/              # Model training outputs (not included in repo)
 └── .gitignore             # Git ignore rules
-
+```
 ## Installation & Usage
 
 1. **Setup Environment**
