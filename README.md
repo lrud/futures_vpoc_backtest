@@ -42,6 +42,7 @@ Advanced algorithmic trading strategy for E-mini S&P 500 (ES) futures that combi
   - Range evolution
 - **Signal Generation**: ML-filtered signals with confidence thresholds
 - **Performance**: Higher per-trade profitability with more selective entry criteria
+- **Distributed Training**: Supports multi-GPU training with AMD ROCm optimization
 
 ### Trade Setup Requirements
 - **Long Entries**:
@@ -77,38 +78,59 @@ Advanced algorithmic trading strategy for E-mini S&P 500 (ES) futures that combi
   - Downward: 46.53%
 
 ## Project Structure
-```
 futures_vpoc_backtest/
-├── NOTEBOOKS/             # Core implementation
+├── src/                    # Refactored, modular implementation
+│   ├── analysis/           # Analysis components
+│   │   ├── __init__.py
+│   │   ├── backtest.py     # Backtesting functionality
+│   │   └── math_utils.py   # Mathematical utilities
+│   ├── config/             # Configuration settings
+│   │   ├── __init__.py
+│   │   └── settings.py     # Global settings and constants
+│   ├── core/               # Core functionality
+│   │   ├── __init__.py
+│   │   ├── data.py         # Data management utilities
+│   │   ├── signals.py      # Trading signal generation
+│   │   └── vpoc.py         # VPOC calculation utilities
+│   ├── ml/                 # Machine learning components
+│   │   ├── __init__.py
+│   │   ├── distributed.py  # Distributed training functionality
+│   │   ├── feature_engineering.py  # Feature extraction and selection
+│   │   ├── model.py        # PyTorch model architecture
+│   │   └── trainer.py      # Training orchestration
+│   ├── scripts/            # Scripts and tests
+│   │   ├── test_backtest.py        # Backtest unit tests
+│   │   ├── test_data_loader.py     # Data loader unit tests
+│   │   ├── test_distributed.py     # Distributed training unit tests
+│   │   ├── test_feature_engineering.py  # Feature engineering unit tests
+│   │   ├── test_ML_total.py        # Integration test
+│   │   └── test_model.py           # Model architecture unit tests
+│   ├── tests/              # Additional tests
+│   └── utils/              # Utility functions
+├── NOTEBOOKS/              # Original implementation
 │   ├── VPOC.py            # Volume profile analysis & calculations
 │   ├── STRATEGY.py        # Trading signal generation
 │   ├── BACKTEST.py        # Performance testing & risk management
 │   ├── MATH.py            # Statistical validation tools
 │   ├── DATA_LOADER.py     # Data preprocessing utilities
-│   ├── ML_TEST.py         # ML model architecture and training
+│   ├── ML_TEST.py         # Original ML model architecture and training
 │   └── ML_BACKTEST.py     # ML-enhanced backtesting framework
+├── DATA/                  # Data directory (not included in repo)
+├── TRAINING/              # Model training outputs (not included in repo)
 └── .gitignore             # Git ignore rules
-
-Required Data Structure (not included):
-- Minute-level ES futures data
-- Columns: timestamp, open, high, low, close, volume
-- Format: CSV with headers
-- Date range: 2021-12-05 to 2025-02-27
-```
 
 ## Installation & Usage
 
 1. **Setup Environment**
-```bash
+
 git clone https://github.com/lrud/futures_vpoc_backtest.git
 cd futures_vpoc_backtest
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-```
 
-2. **Run Analysis Pipeline**
-```bash
+2. **Run Original Analysis Pipeline**
+
 cd NOTEBOOKS
 
 # Generate VPOC and mathematical analysis
@@ -121,7 +143,42 @@ python DATA_LOADER.py  # Clean and prepare market data
 # Generate signals and evaluate performance
 python STRATEGY.py   # Generate trading signals with confidence scores
 python BACKTEST.py   # Run performance analysis with risk management
-```
+
+3. **Use Refactored ML Components**
+
+# Import components in your Python code
+from src.core.data import FuturesDataManager
+from src.ml.feature_engineering import prepare_features_and_labels
+from src.ml.model import AMDOptimizedFuturesModel
+from src.ml.distributed import AMDFuturesTensorParallel
+
+# Load data
+data_manager = FuturesDataManager()
+data = data_manager.load_futures_data()
+
+# Prepare features
+X, y, feature_cols, scaler = prepare_features_and_labels(
+    data, use_feature_selection=True, max_features=15
+)
+
+# Create and train model
+model = AMDOptimizedFuturesModel(input_dim=len(feature_cols))
+
+# For distributed training
+trainer = AMDFuturesTensorParallel()
+trainer.train_ddp(num_epochs=50, batch_size=64)
+
+4. **Run Tests**
+
+# Run unit tests for components
+python -m src.scripts.test_distributed
+python -m src.scripts.test_feature_engineering
+python -m src.scripts.test_model
+python -m src.scripts.test_backtest
+python -m src.scripts.test_data_loader
+
+# Run integration test
+python -m src.scripts.test_ML_total
 
 Each script performs specific tasks:
 - VPOC.py: Generates volume profiles, VPOCs, and value areas
@@ -131,7 +188,6 @@ Each script performs specific tasks:
 - BACKTEST.py: Tests strategy with realistic commission and slippage
 
 ## Dependencies
-```txt
 pandas==2.0.0
 numpy==1.24.0
 scipy==1.10.0
@@ -139,7 +195,22 @@ matplotlib==3.7.0
 seaborn==0.12.2
 pandas-ta==0.3.14b
 statsmodels==0.14.0
-```
+torch>=2.0.0
+scikit-learn>=1.0.0
+
+## ML Refactoring Notes
+
+The ML components have been refactored from the original monolithic ML_TEST.py script into modular components:
+
+- **Feature Engineering**: Extracts and selects features from raw futures data
+- **Model Architecture**: PyTorch neural network optimized for AMD GPUs
+- **Distributed Training**: Multi-GPU training using PyTorch's DDP
+- **Model Management**: Utilities for saving and loading models with metadata
+
+This refactoring improves:
+- **Maintainability**: Easier to understand and modify individual components
+- **Testability**: Each component has dedicated unit tests
+- **Extensibility**: New features can be added without modifying existing code
 
 ## License
 MIT License - See LICENSE file for details
