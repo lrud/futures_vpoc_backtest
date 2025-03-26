@@ -122,82 +122,87 @@ futures_vpoc_backtest/
 ```
 ## Installation & Usage
 
-1. **Setup Environment**
-
+### 1. Setup Environment
+```bash setup.sh
+# Clone repository and install dependencies
 git clone https://github.com/lrud/futures_vpoc_backtest.git
 cd futures_vpoc_backtest
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+```
 
-2. **Run Original Analysis Pipeline**
-
+### 2. Run Legacy Analysis Pipeline
+```bash run_legacy.sh
 cd NOTEBOOKS
+python VPOC.py      # Volume profile calculations
+python MATH.py      # Statistical validation
+python DATA_LOADER.py  # Data preprocessing
+python STRATEGY.py   # Signal generation
+python BACKTEST.py   # Performance backtesting
+```
 
-# Generate VPOC and mathematical analysis
-python VPOC.py      # Calculate volume profiles and value areas
-python MATH.py      # Perform statistical validation
-
-# Process and validate data
-python DATA_LOADER.py  # Clean and prepare market data
-
-# Generate signals and evaluate performance
-python STRATEGY.py   # Generate trading signals with confidence scores
-python BACKTEST.py   # Run performance analysis with risk management
-
-3. **Use Refactored ML Components**
-
-# Import components in your Python code
+### 3. Use Refactored ML Components
+```python example_usage.py
 from src.core.data import FuturesDataManager
-from src.ml.feature_engineering import prepare_features_and_labels
-from src.ml.model import AMDOptimizedFuturesModel
 from src.ml.distributed import AMDFuturesTensorParallel
 
-# Load data
-data_manager = FuturesDataManager()
-data = data_manager.load_futures_data()
-
-# Prepare features
-X, y, feature_cols, scaler = prepare_features_and_labels(
-    data, use_feature_selection=True, max_features=15
-)
-
-# Create and train model
-model = AMDOptimizedFuturesModel(input_dim=len(feature_cols))
-
-# For distributed training
+# Initialize and train
+data = FuturesDataManager().load_futures_data(contract="ES")
 trainer = AMDFuturesTensorParallel()
-trainer.train_ddp(num_epochs=50, batch_size=64)
+trainer.train_ddp(num_epochs=50, batch_size=64)  # Multi-GPU training
+```
 
-4. **Run Tests**
-
-# Run unit tests for components
-python -m src.scripts.test_distributed
-python -m src.scripts.test_feature_engineering
-python -m src.scripts.test_model
+### 4. Run Tests
+```bash run_tests.sh
+# Unit tests
 python -m src.scripts.test_backtest
-python -m src.scripts.test_data_loader
+python -m src.scripts.test_distributed
 
-# Run integration test
+# Integration test
 python -m src.scripts.test_ML_total
+```
 
-Each script performs specific tasks:
-- VPOC.py: Generates volume profiles, VPOCs, and value areas
-- MATH.py: Calculates trend slopes, R-squared values, and Bayesian probabilities
-- DATA_LOADER.py: Preprocesses market data and validates data integrity
-- STRATEGY.py: Combines analysis to generate high-probability trade signals
-- BACKTEST.py: Tests strategy with realistic commission and slippage
+### Key Scripts
+| Script | Purpose | Location |
+|--------|---------|----------|
+| `VPOC.py` | Volume profile analysis | `NOTEBOOKS/` |
+| `distributed.py` | Multi-GPU training | `src/ml/` |
+| `test_ML_total.py` | End-to-end validation | `src/scripts/` |
 
 ## Dependencies
-pandas==2.0.0
-numpy==1.24.0
-scipy==1.10.0
-matplotlib==3.7.0
-seaborn==0.12.2
-pandas-ta==0.3.14b
-statsmodels==0.14.0
-torch>=2.0.0
-scikit-learn>=1.0.0
+
+```text requirements.txt
+# Core Data & Math
+pandas==2.0.0                # src/core/data.py (data loading)
+numpy==1.24.0                # src/analysis/math_utils.py (calculations)
+scipy==1.10.0                # src/ml/feature_engineering.py (statistical features)
+
+# Machine Learning
+torch>=2.0.0                 # src/ml/model.py (PyTorch model)
+scikit-learn>=1.0.0          # src/ml/feature_engineering.py (feature selection)
+
+# Visualization
+matplotlib==3.7.0            # src/core/vpoc.py (volume profile plots)
+seaborn==0.12.2              # src/analysis/backtest.py (performance visuals)
+
+# Trading & Statistics
+pandas-ta==0.3.14b           # NOTEBOOKS/STRATEGY.py (technical indicators)
+statsmodels==0.14.0          # NOTEBOOKS/MATH.py (regression analysis)
+
+# Distributed Training
+mpi4py                       # src/ml/distributed.py (multi-GPU coordination)
+```
+
+### Key File Associations:
+- **`torch`**: Used in `src/ml/distributed.py` for AMD GPU-optimized training.
+- **`pandas-ta`**: Legacy dependency in `NOTEBOOKS/STRATEGY.py` for TA-Lib wrappers.
+- **`mpi4py`**: Critical for `mp.spawn()` in distributed training (`src/ml/distributed.py`).
+
+To install:  
+```bash setup.sh
+pip install -r requirements.txt
+```
 
 ## ML Refactoring Notes
 
