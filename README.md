@@ -81,19 +81,19 @@ Advanced algorithmic trading strategy for E-mini S&P 500 (ES) futures that combi
 futures_vpoc_backtest/
 ├── src/                    # Refactored, modular implementation
 │   ├── analysis/           # Analysis components
-│   │   ├── __init__.py
+│   │   ├── `__init__.py`
 │   │   ├── backtest.py     # Backtesting functionality
 │   │   └── math_utils.py   # Mathematical utilities
 │   ├── config/             # Configuration settings
-│   │   ├── __init__.py
+│   │   ├── `__init__.py`
 │   │   └── settings.py     # Global settings and constants
 │   ├── core/               # Core functionality
-│   │   ├── __init__.py
+│   │   ├── `__init__.py`
 │   │   ├── data.py         # Data management utilities
 │   │   ├── signals.py      # Trading signal generation
 │   │   └── vpoc.py         # VPOC calculation utilities
 │   ├── ml/                 # Machine learning components
-│   │   ├── __init__.py
+│   │   ├── `__init__.py`
 │   │   ├── distributed.py  # Distributed training functionality
 │   │   ├── feature_engineering.py  # Feature extraction and selection
 │   │   ├── model.py        # PyTorch model architecture
