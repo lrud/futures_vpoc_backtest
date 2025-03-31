@@ -223,6 +223,8 @@ pip install -r requirements.txt
 
 The ML components have been refactored from the original monolithic ML_TEST.py script into modular components:
 
+![ML Pipeline Workflow Diagram](flow.png)
+
 - **Feature Engineering**: (`src/ml/feature_engineering.py`) Extracts and selects features.
 - **Model Architecture**: (`src/ml/model.py`) PyTorch neural network optimized for AMD GPUs.
 - **Distributed Training**: (`src/ml/distributed_trainer.py`) Multi-GPU training using PyTorch's DDP.
