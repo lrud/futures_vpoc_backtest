@@ -84,7 +84,8 @@ futures_vpoc_backtest/
 │   ├── analysis/           # Analysis components
 │   │   ├── `__init__.py`
 │   │   ├── backtest.py     # Backtesting functionality
-│   │   └── math_utils.py   # Mathematical utilities
+│   │   ├── math_utils.py   # Mathematical utilities
+│   │   └── run_ml_backtest.py # Script to run ML-enhanced backtest
 │   ├── config/             # Configuration settings
 │   │   ├── `__init__.py`
 │   │   └── settings.py     # Global settings and constants
@@ -95,18 +96,28 @@ futures_vpoc_backtest/
 │   │   └── vpoc.py         # VPOC calculation utilities
 │   ├── ml/                 # Machine learning components
 │   │   ├── `__init__.py`
-│   │   ├── distributed.py  # Distributed training functionality
+│   │   ├── arguments.py            # Argument parsing for ML scripts
+│   │   ├── backtest_integration.py # Integration with backtesting engine
+│   │   ├── cmd_runner.py           # Command running utilities
+│   │   ├── distributed_trainer.py  # Distributed training functionality (replaces distributed.py)
+│   │   ├── evaluate_models.py      # Model evaluation scripts
 │   │   ├── feature_engineering.py  # Feature extraction and selection
-│   │   ├── model.py        # PyTorch model architecture
-│   │   └── trainer.py      # Training orchestration
+│   │   ├── model.py                # PyTorch model architecture
+│   │   ├── train.py                # Main training script
+│   │   ├── trainer_core.py         # Core training loop logic
+│   │   └── trainer_utils.py        # Utility functions for training
 │   ├── scripts/            # Scripts and tests
 │   │   ├── test_backtest.py        # Backtest unit tests
 │   │   ├── test_data_loader.py     # Data loader unit tests
-│   │   ├── test_distributed.py     # Distributed training unit tests
+│   │   ├── test_distributed.py     # Distributed training unit tests (may need update/removal)
 │   │   ├── test_feature_engineering.py  # Feature engineering unit tests
 │   │   ├── test_ML_total.py        # Integration test
-│   │   └── test_model.py           # Model architecture unit tests
-│   ├── tests/              # Additional tests
+│   │   ├── test_model.py           # Model architecture unit tests
+│   │   ├── test_signal.py          # Signal generation tests
+│   │   ├── test_vix_features.py    # VIX feature tests
+│   │   └── test_vpoc.py            # VPOC calculation tests
+│   ├── tests/              # Additional tests (e.g., integration)
+│   │   └── test_ml_backtest.py     # ML backtest specific tests
 │   └── utils/              # Utility functions
 ├── NOTEBOOKS/              # Original implementation
 │   ├── VPOC.py            # Volume profile analysis & calculations
@@ -145,21 +156,24 @@ python BACKTEST.py   # Performance backtesting
 ### 3. Use Refactored ML Components
 ```python example_usage.py
 from src.core.data import FuturesDataManager
-from src.ml.distributed import AMDFuturesTensorParallel
+from src.ml.train import start_training # Updated import
 
-# Initialize and train
-data = FuturesDataManager().load_futures_data(contract="ES")
-trainer = AMDFuturesTensorParallel()
-trainer.train_ddp(num_epochs=50, batch_size=64)  # Multi-GPU training
+# Example: Load data and start training
+# (Actual arguments might differ based on train.py implementation)
+data_manager = FuturesDataManager()
+# Assuming start_training handles data loading or takes data path
+start_training(config_path='path/to/config.yaml') # Example call
 ```
 
 ### 4. Run Tests
 ```bash run_tests.sh
-# Unit tests
-python -m src.scripts.test_backtest
-python -m src.scripts.test_distributed
+# Example unit tests (adjust based on actual test structure)
+python -m unittest src/scripts/test_backtest.py
+python -m unittest src/scripts/test_model.py
+python -m unittest src/tests/test_ml_backtest.py # New test file
+python -m unittest src/scripts/test_vix_features.py # New test file
 
-# Integration test
+# Example integration test
 python -m src.scripts.test_ML_total
 ```
 
@@ -167,7 +181,8 @@ python -m src.scripts.test_ML_total
 | Script | Purpose | Location |
 |--------|---------|----------|
 | `VPOC.py` | Volume profile analysis | `NOTEBOOKS/` |
-| `distributed.py` | Multi-GPU training | `src/ml/` |
+| `train.py` | Main ML model training script | `src/ml/` |
+| `run_ml_backtest.py` | Run ML-enhanced backtest | `src/analysis/` |
 | `test_ML_total.py` | End-to-end validation | `src/scripts/` |
 
 ## Dependencies
@@ -191,13 +206,13 @@ pandas-ta==0.3.14b           # NOTEBOOKS/STRATEGY.py (technical indicators)
 statsmodels==0.14.0          # NOTEBOOKS/MATH.py (regression analysis)
 
 # Distributed Training
-mpi4py                       # src/ml/distributed.py (multi-GPU coordination)
+mpi4py                       # src/ml/distributed_trainer.py (multi-GPU coordination)
 ```
 
 ### Key File Associations:
-- **`torch`**: Used in `src/ml/distributed.py` for AMD GPU-optimized training.
+- **`torch`**: Used in `src/ml/distributed_trainer.py` and other ML files for AMD GPU-optimized training.
 - **`pandas-ta`**: Legacy dependency in `NOTEBOOKS/STRATEGY.py` for TA-Lib wrappers.
-- **`mpi4py`**: Critical for `mp.spawn()` in distributed training (`src/ml/distributed.py`).
+- **`mpi4py`**: Critical for `mp.spawn()` in distributed training (`src/ml/distributed_trainer.py`).
 
 To install:  
 ```bash setup.sh
@@ -208,10 +223,12 @@ pip install -r requirements.txt
 
 The ML components have been refactored from the original monolithic ML_TEST.py script into modular components:
 
-- **Feature Engineering**: Extracts and selects features from raw futures data
-- **Model Architecture**: PyTorch neural network optimized for AMD GPUs
-- **Distributed Training**: Multi-GPU training using PyTorch's DDP
-- **Model Management**: Utilities for saving and loading models with metadata
+- **Feature Engineering**: (`src/ml/feature_engineering.py`) Extracts and selects features.
+- **Model Architecture**: (`src/ml/model.py`) PyTorch neural network optimized for AMD GPUs.
+- **Distributed Training**: (`src/ml/distributed_trainer.py`) Multi-GPU training using PyTorch's DDP.
+- **Training Orchestration**: (`src/ml/train.py`, `src/ml/trainer_core.py`) Manages the training process.
+- **Backtest Integration**: (`src/ml/backtest_integration.py`) Connects ML predictions to the backtester.
+- **Model Management**: (`src/ml/trainer_utils.py`, `src/ml/evaluate_models.py`) Utilities for saving, loading, and evaluating models.
 
 This refactoring improves:
 - **Maintainability**: Easier to understand and modify individual components
