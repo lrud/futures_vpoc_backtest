@@ -1,343 +1,310 @@
+"""
+Data handling functionality for futures markets.
+Handles loading, cleaning, and merging different data sources.
+"""
+
+import os
 import pandas as pd
 import numpy as np
-import os
 import glob
-from datetime import datetime
-import logging
-from typing import Optional, List, Dict, Union, Tuple
+from typing import Optional, Dict, List, Union
+import datetime as dt
 
 from src.utils.logging import get_logger
+from src.config.settings import settings
 
 class FuturesDataManager:
     """
-    Data loading and preprocessing for futures data.
-    Provides methods to load, clean, and validate futures data.
+    Handles loading and preprocessing of futures market data.
+    Supports both ES and VIX data formats.
     """
     
-    def __init__(self, data_dir=None):
-        """
-        Initialize the DataLoader with settings.
-        
-        Args:
-            data_dir: Path to the directory containing data files
-        """
+    def __init__(self):
+        """Initialize data manager."""
         self.logger = get_logger(__name__)
-        
-        # Try to get data_dir from settings if not provided
-        if data_dir is None:
-            try:
-                from src.config.settings import settings
-                self.data_dir = settings.DATA_DIR
-            except (ImportError, AttributeError):
-                self.data_dir = os.path.join(os.getcwd(), 'DATA')
-        else:
-            self.data_dir = data_dir
-            
-        self.logger.info(f"Initialized with data directory: {self.data_dir}")
-        
-        # Get additional settings if available
-        try:
-            from src.config.settings import settings
-            self.low_price_threshold = getattr(settings, 'LOW_PRICE_THRESHOLD', 1000)
-        except (ImportError, AttributeError):
-            self.low_price_threshold = 1000
+        self.data_cache = {}
     
-    def load_futures_data(self, data_directory=None) -> Optional[pd.DataFrame]:
+    def load_futures_data(self, data_path: str = None) -> pd.DataFrame:
         """
-        Loads, merges, and cleans futures data from text files in the specified directory.
-        Includes logging for potentially erroneous low prices and filters them out.
-
-        Args:
-            data_directory: Path to the directory containing .txt data files.
-
-        Returns:
-            Combined and cleaned futures data, or None if no valid data is found.
-        """
-        data_dir = data_directory or self.data_dir
+        Load futures data from file or directory.
         
-        self.logger.info(f"Loading futures data from: {data_dir}")
-        print(f"\n===== LOADING FUTURES DATA =====")
-        print(f"Looking for text files in: {data_dir}")
-
-        # Use glob to find all .txt files in the directory
-        file_paths = glob.glob(os.path.join(data_dir, '*.txt'))
-        print(f"Found {len(file_paths)} text files.")
-
-        if not file_paths:
-            self.logger.warning(f"No text files found in {data_dir}")
-            print(f"Warning: No text files found in {data_dir}. Please check the directory.")
+        Parameters:
+        -----------
+        data_path: str, optional
+            Path to data file or directory containing data files
+            
+        Returns:
+        --------
+        pandas.DataFrame
+            DataFrame with futures data
+        """
+        data_path = data_path or settings.DATA_DIR
+        self.logger.info(f"Loading futures data from {data_path}")
+        
+        # Handle file case
+        if os.path.isfile(data_path):
+            df = self.load_futures_data_file(data_path)
+            if df is not None:
+                # Ensure contract column exists (from filename if needed)
+                if 'contract' not in df.columns:
+                    contract = os.path.basename(data_path).split("_")[0]
+                    df['contract'] = contract
+                return df
             return None
-
-        # Initialize a list to store dataframes from each file
-        all_dfs = []
-
-        # Process each file
-        for file_path in file_paths:
-            file_name = os.path.basename(file_path)
-            print(f"\nProcessing file: {file_name}")
-
+            
+        # Handle directory case
+        if not os.path.isdir(data_path):
+            self.logger.error(f"Data path not found: {data_path}")
+            return None
+        
+        # Find all CSV files in directory
+        csv_files = glob.glob(os.path.join(data_path, "*.csv"))
+        
+        if not csv_files:
+            self.logger.error(f"No CSV files found in {data_path}")
+            return None
+        
+        # Load and combine all files
+        dfs = []
+        for file in csv_files:
             try:
-                df = pd.read_table(file_path, sep=';', header=None, 
-                                  names=['date_time_str', 'open', 'high', 'low', 'close', 'volume'])
-            except FileNotFoundError:
-                self.logger.error(f"File not found at {file_path}")
-                print(f"Error: File not found at {file_path}")
-                continue
-            except pd.errors.ParserError as e:
-                self.logger.error(f"Error parsing file {file_name}: {e}")
-                print(f"Error parsing file {file_name} with pandas: {e}")
-                continue
+                # Extract contract from filename
+                contract = os.path.basename(file).split("_")[0]
+                
+                # Load data
+                df = self.load_futures_data_file(file)
+                
+                if df is not None:
+                    # Add contract column if not present
+                    if 'contract' not in df.columns:
+                        df['contract'] = contract
+                    
+                    dfs.append(df)
+                    self.logger.info(f"Loaded {len(df)} rows from {os.path.basename(file)}")
             except Exception as e:
-                self.logger.error(f"Unexpected error reading file {file_name}: {str(e)}")
-                print(f"Unexpected error reading file {file_name}: {str(e)}")
-                continue
-
-            print(f"Successfully loaded file with {len(df)} rows.")
-            self.logger.info(f"Loaded {file_name} with {len(df)} rows")
-
-            try:
-                # Convert timestamp and handle date formatting
-                df['timestamp'] = pd.to_datetime(df['date_time_str'], format='%Y%m%d %H%M%S', errors='raise')
-                df = df.drop('date_time_str', axis=1)
-                df.set_index('timestamp', inplace=True)
-                df['date'] = df.index.date
-            except ValueError as e:
-                self.logger.error(f"Error converting timestamp in {file_name}: {e}")
-                print(f"Error converting timestamp in {file_name}: {e}")
-                print("Skipping file due to timestamp conversion error.")
-                continue
-
-            # Add contract and session information
-            df['contract'] = file_name.replace('.Last.txt', '')
-            df['session'] = 'ETH'  # Default session
+                self.logger.error(f"Error loading {file}: {e}")
+                
+        if not dfs:
+            self.logger.error("Failed to load any data files")
+            return None
             
-            # Vectorized session assignment (RTH is 9:30 AM to 4:00 PM)
-            df.loc[(df.index.hour >= 9) & (df.index.hour < 16) & 
-                   ~((df.index.hour == 9) & (df.index.minute < 30)), 'session'] = 'RTH'
-
-            # --- Enhanced Logging and Filtering for Potentially Erroneous Low Prices ---
-            low_price_threshold = self.low_price_threshold
-            initial_len = len(df)
+        # Combine all data
+        data = pd.concat(dfs, ignore_index=True)
+        
+        # Cache for reuse
+        self.data_cache[data_path] = data
+        
+        self.logger.info(f"Combined data: {len(data)} rows, contracts: {data['contract'].unique()}")
+        return data
+    
+    def load_futures_data_file(self, file_path: str) -> pd.DataFrame:
+        """
+        Load a single futures data file.
+        
+        Parameters:
+        -----------
+        file_path: str
+            Path to CSV file
             
-            # Filter out low prices using vectorized operations
-            df_filtered = df[df['open'] >= low_price_threshold]
-            df_filtered = df_filtered[df_filtered['low'] >= low_price_threshold]
-
-            removed_count = initial_len - len(df_filtered)
-            if removed_count > 0:
-                self.logger.warning(
-                    f"Removed {removed_count} rows with prices below {low_price_threshold} from {file_name}")
-                print(f"Warning: Removed {removed_count} rows with open/low prices below {low_price_threshold} from {file_name}.")
-                df = df_filtered
-
-            print(f"Data shape for {file_name}: {df.shape}")
-
-            # Remove duplicate timestamps with vectorized operation
-            if df.index.duplicated().any():
-                dupes = df.index.duplicated().sum()
-                self.logger.warning(f"Found {dupes} duplicate timestamps in {file_name}")
-                print(f"Warning: Found duplicate timestamps in {file_name}. Removing duplicates (keeping first).")
-                df = df[~df.index.duplicated(keep='first')]
-
-            # Check for missing values
-            missing_values = df.isna().sum()
-            if missing_values.sum() > 0:
-                self.logger.warning(f"Missing values found in {file_name}: {missing_values}")
-                print(f"Warning: Missing values found in {file_name}:\n{missing_values}")
-
-            # Check for zero or negative prices
-            if (df[['open', 'high', 'low', 'close']] <= 0).any().any():
-                self.logger.warning(f"Zero or negative prices found in {file_name}")
-                print(f"Warning: Found zero or negative prices in {file_name}")
-
-            # Check for high < low inconsistencies
-            if (df['high'] < df['low']).any():
-                self.logger.warning(f"High < low inconsistencies found in {file_name}")
-                print(f"Warning: Found high < low inconsistencies in {file_name}")
-
-            # Check for OHLC relationship inconsistencies
-            ohlc_issues = ((df['open'] > df['high']) | (df['open'] < df['low']) | 
-                          (df['close'] > df['high']) | (df['close'] < df['low']))
-                          
-            if ohlc_issues.any():
-                self.logger.warning(f"Found {ohlc_issues.sum()} OHLC relationship inconsistencies in {file_name}")
-                print(f"Warning: Found {ohlc_issues.sum()} OHLC relationship inconsistencies in {file_name}")
-
-            # Calculate additional metrics with vectorized operations
-            df['bar_range'] = df['high'] - df['low']
-            df['bar_return'] = df['close'].pct_change()
-
-            all_dfs.append(df)
-            print(f"Successfully processed {file_name}")
-            self.logger.info(f"Successfully processed {file_name}")
-
-        # Combine all dataframes and sort by timestamp
-        if all_dfs:
-            combined_df = pd.concat(all_dfs, axis=0)
-            combined_df.sort_index(inplace=True)
-
-            # Log dataset summary
-            self._log_dataset_summary(combined_df)
+        Returns:
+        --------
+        pandas.DataFrame
+            DataFrame with futures data
+        """
+        try:
+            # Check file exists
+            if not os.path.exists(file_path):
+                self.logger.error(f"File not found: {file_path}")
+                return None
             
-            return combined_df
-        else:
-            self.logger.warning("No valid data was processed from any file")
-            print("No valid data was processed from any file.")
+            # Use cached data if available
+            if file_path in self.data_cache:
+                return self.data_cache[file_path].copy()
+            
+            # Read CSV file
+            data = pd.read_csv(file_path)
+            
+            # Clean and preprocess
+            data = self._preprocess_data(data)
+            
+            # Cache for reuse
+            self.data_cache[file_path] = data
+            
+            return data
+            
+        except Exception as e:
+            self.logger.error(f"Error loading {file_path}: {e}")
             return None
     
-    def _log_dataset_summary(self, df: pd.DataFrame) -> None:
+    def _preprocess_data(self, data: pd.DataFrame) -> pd.DataFrame:
         """
-        Logs and prints a summary of the combined dataset.
+        Clean and preprocess futures data.
         
-        Args:
-            df: Combined DataFrame to summarize
-        """
-        print("\n===== Combined Dataset Summary =====")
-        print(f"Total records: {len(df)}")
-        print(f"Date range: {df.index.min()} to {df.index.max()}")
-        print(f"Number of contracts: {df['contract'].nunique()}")
-        print(f"Contracts: {', '.join(df['contract'].unique())}")
-        print(f"RTH sessions: {(df['session'] == 'RTH').sum()}")
-        print(f"ETH sessions: {(df['session'] == 'ETH').sum()}")
-
-        print("\nPrice statistics:")
-        print(df[['open', 'high', 'low', 'close']].describe())
-
-        print("\nVolume statistics:")
-        print(df['volume'].describe())
-        
-        self.logger.info(f"Loaded combined dataset with {len(df)} records")
-        self.logger.info(f"Date range: {df.index.min()} to {df.index.max()}")
-        self.logger.info(f"Contracts: {df['contract'].nunique()} unique contracts")
-    
-    def save_cleaned_data(self, df: pd.DataFrame, output_directory=None, 
-                         file_name=None) -> str:
-        """
-        Save cleaned data to a CSV file.
-        
-        Args:
-            df: DataFrame to save
-            output_directory: Directory to save the file in
-            file_name: Name of the output file
+        Parameters:
+        -----------
+        data: pandas.DataFrame
+            Raw data
             
         Returns:
-            Path to the saved file
+        --------
+        pandas.DataFrame
+            Cleaned data
         """
-        # Try to get output directory from settings if not provided
-        if output_directory is None:
-            try:
-                from src.config.settings import settings
-                output_dir = settings.CLEANED_DATA_DIR
-            except (ImportError, AttributeError):
-                output_dir = os.path.join(os.getcwd(), 'DATA', 'CLEANED')
-        else:
-            output_dir = output_directory
-            
-        os.makedirs(output_dir, exist_ok=True)
-        
-        if file_name is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            file_name = f"cleaned_futures_data_{timestamp}.csv"
-            
-        output_path = os.path.join(output_dir, file_name)
+        # Make a copy to avoid modifying original
+        df = data.copy()
         
         try:
-            df.to_csv(output_path)
-            self.logger.info(f"Saved cleaned data to {output_path}")
-            print(f"Saved cleaned data to {output_path}")
-            return output_path
-        except Exception as e:
-            self.logger.error(f"Error saving cleaned data: {str(e)}")
-            print(f"Error saving cleaned data: {str(e)}")
-            return ""
-    
-    def filter_by_contract(self, df: pd.DataFrame, contract_prefix: str) -> pd.DataFrame:
-        """
-        Filter data for a specific futures contract.
-        
-        Args:
-            df: DataFrame to filter
-            contract_prefix: Contract prefix to filter (e.g., 'ES')
+            # Handle common column name formats for different data sources
+            # Try to standardize to lowercase names
+            column_mappings = {
+                # Standard capitalized names
+                'Open': 'open', 'High': 'high', 'Low': 'low', 'Close': 'close', 'Volume': 'volume',
+                # VIX specific column names
+                'OPEN': 'open', 'HIGH': 'high', 'LOW': 'low', 'CLOSE': 'close', 'VOLUME': 'volume',
+                # Date/time column variations
+                'DATE': 'date', 'Date': 'date', 'Time': 'timestamp', 'TIMESTAMP': 'timestamp',
+                # Additional columns for merged data
+                'Bar_Range': 'bar_range', 'BarRange': 'bar_range', 'BAR_RANGE': 'bar_range',
+                'Bar_Return': 'bar_return', 'BarReturn': 'bar_return', 'BAR_RETURN': 'bar_return',
+                'VIX': 'vix', 'Volatility': 'vix', 'VOLATILITY': 'vix',
+                'Contract': 'contract', 'CONTRACT': 'contract',
+                'Session': 'session', 'SESSION': 'session'
+            }
             
-        Returns:
-            DataFrame with data for the specified contract
-        """
-        if df is None or df.empty:
-            self.logger.warning("Cannot filter empty DataFrame by contract")
-            return pd.DataFrame()
+            # Apply column renaming where columns exist
+            rename_dict = {old: new for old, new in column_mappings.items() if old in df.columns}
+            if rename_dict:
+                df = df.rename(columns=rename_dict)
+                self.logger.info(f"Renamed columns: {rename_dict}")
             
-        # Filter for the specified contract
-        contract_df = df[df['contract'].str.startswith(contract_prefix)]
-        
-        if len(contract_df) == 0:
-            self.logger.warning(f"No data found for contract prefix '{contract_prefix}'")
-            print(f"Warning: No data found for contract prefix '{contract_prefix}'")
-            return pd.DataFrame()
+            # Convert timestamp/date column if needed
+            if 'timestamp' in df.columns:
+                time_col = 'timestamp'
+            elif 'date' in df.columns:
+                time_col = 'date'
+            else:
+                self.logger.error("No timestamp or date column found")
+                return None
+                
+            if not pd.api.types.is_datetime64_any_dtype(df[time_col]):
+                df[time_col] = pd.to_datetime(df[time_col])
+                self.logger.info(f"Converted {time_col} column to datetime")
             
-        self.logger.info(f"Filtered to {len(contract_df)} records for contract '{contract_prefix}'")
-        print(f"Filtered to {len(contract_df)} records for contract '{contract_prefix}'")
-        
-        return contract_df
-    
-    def filter_by_session(self, df: pd.DataFrame, session_type: str = 'RTH') -> pd.DataFrame:
-        """
-        Filter data by session type.
-        
-        Args:
-            df: DataFrame to filter
-            session_type: Session type to filter for ('RTH' or 'ETH')
+            # Set timestamp as index
+            df = df.set_index(time_col)
+            self.logger.info(f"Set {time_col} column as index")
             
-        Returns:
-            Filtered DataFrame
-        """
-        if df is None or df.empty:
-            self.logger.warning("Cannot filter empty DataFrame by session")
-            return pd.DataFrame()
+            # Ensure required columns
+            required_cols = ['open', 'high', 'low', 'close']
+            optional_cols = ['bar_range', 'bar_return', 'vix', 'contract', 'session']
             
-        if 'session' not in df.columns:
-            self.logger.warning("DataFrame does not contain 'session' column. Cannot filter by session.")
-            print("Warning: DataFrame does not contain 'session' column. Cannot filter by session.")
+            # Check required columns
+            missing_cols = [col for col in required_cols if col not in df.columns]
+            
+            if missing_cols:
+                self.logger.warning(f"Missing required columns: {missing_cols}")
+                # Try to find columns that might contain the required data
+                for req_col in missing_cols:
+                    potential_matches = [col for col in df.columns if req_col.lower() in col.lower()]
+                    if potential_matches:
+                        df[req_col] = df[potential_matches[0]]
+                        self.logger.info(f"Using {potential_matches[0]} as {req_col}")
+                    else:
+                        self.logger.error(f"Required column {req_col} missing and no alternative found")
+                        return None
+            
+            # Check if volume is missing - this is optional for VIX data
+            if 'volume' not in df.columns:
+                self.logger.warning(f"Missing volume column, adding placeholder with 0 values")
+                df['volume'] = 0  # Add a placeholder volume column with zeros
+                
+            # Identify contract type if not present
+            if 'contract' not in df.columns:
+                # Try to determine from filename in index name
+                df['contract'] = 'UNKNOWN'
+            
+            # Add session column if not present
+            if 'session' not in df.columns:
+                # Default to RTH (Regular Trading Hours)
+                df['session'] = 'RTH'
+            
+            # Sort by date
+            df = df.sort_index()
+            
+            # Handle duplicate timestamps
+            if df.index.duplicated().any():
+                self.logger.warning(f"Found duplicate timestamps, keeping last value")
+                df = df[~df.index.duplicated(keep='last')]
+            
+            # Handle missing values
+            if df.isna().any().any():
+                self.logger.warning(f"Found missing values, filling with appropriate methods")
+                # Fill missing OHLC with forward fill, volume with 0
+                df[['open', 'high', 'low', 'close']] = df[['open', 'high', 'low', 'close']].ffill()
+                df['volume'] = df['volume'].fillna(0)
+                
+            # Validate data types
+            df['open'] = pd.to_numeric(df['open'], errors='coerce')
+            df['high'] = pd.to_numeric(df['high'], errors='coerce')
+            df['low'] = pd.to_numeric(df['low'], errors='coerce')
+            df['close'] = pd.to_numeric(df['close'], errors='coerce')
+            df['volume'] = pd.to_numeric(df['volume'], errors='coerce')
+            
+            # Drop any rows that still have NaN after conversion
+            if df.isna().any().any():
+                before_count = len(df)
+                df = df.dropna(subset=['open', 'high', 'low', 'close'])
+                after_count = len(df)
+                self.logger.warning(f"Dropped {before_count - after_count} rows with NaN values")
+                
+            # Calculate bar_range if missing but OHLC present
+            if 'bar_range' not in df.columns and all(col in df.columns for col in ['high', 'low']):
+                df['bar_range'] = df['high'] - df['low']
+                self.logger.info("Calculated bar_range from high-low")
+            
+            # Calculate bar_return if missing but open/close present
+            if 'bar_return' not in df.columns and all(col in df.columns for col in ['open', 'close']):
+                df['bar_return'] = (df['close'] - df['open']) / df['open']
+                self.logger.info("Calculated bar_return from (close-open)/open")
+            
+            # Initialize VIX column if missing
+            if 'vix' not in df.columns:
+                df['vix'] = np.nan
+                self.logger.info("Initialized missing VIX column with NaN")
+            
+            # Add date column back for convenience in downstream processing
+            df['date'] = df.index.date.astype(str) if isinstance(df.index, pd.DatetimeIndex) else pd.to_datetime(df.index).date.astype(str)
+                
             return df
             
-        filtered_df = df[df['session'] == session_type]
-        
-        self.logger.info(f"Filtered to {session_type} session: {len(filtered_df)} records")
-        print(f"Filtered to {session_type} session: {len(filtered_df)} records")
-        
-        return filtered_df
+        except Exception as e:
+            self.logger.error(f"Error preprocessing data: {e}")
+            import traceback
+            self.logger.error(traceback.format_exc())
+            return data  # Return original if preprocessing fails
     
-    def filter_by_date_range(self, df: pd.DataFrame, start_date=None, end_date=None) -> pd.DataFrame:
+    def split_by_contract(self, data: pd.DataFrame) -> Dict[str, pd.DataFrame]:
         """
-        Filter data by date range.
+        Split data by contract type.
         
-        Args:
-            df: DataFrame to filter
-            start_date: Start date for filtering (inclusive)
-            end_date: End date for filtering (inclusive)
+        Parameters:
+        -----------
+        data: pandas.DataFrame
+            Combined data
             
         Returns:
-            Filtered DataFrame
+        --------
+        Dict[str, pandas.DataFrame]
+            Dictionary with data for each contract
         """
-        if df is None or df.empty:
-            self.logger.warning("Cannot filter empty DataFrame by date range")
-            return pd.DataFrame()
+        if 'contract' not in data.columns:
+            self.logger.error("No contract column in data")
+            return {'UNKNOWN': data}
+            
+        result = {}
         
-        # Make a copy to avoid modifying the original
-        filtered_df = df.copy()
-        
-        # Convert date strings to datetime if necessary
-        if start_date and isinstance(start_date, str):
-            start_date = pd.to_datetime(start_date).date()
-        if end_date and isinstance(end_date, str):
-            end_date = pd.to_datetime(end_date).date()
-        
-        # Apply filters
-        if start_date:
-            filtered_df = filtered_df[filtered_df['date'] >= start_date]
-            self.logger.info(f"Filtered to dates >= {start_date}: {len(filtered_df)} records")
-        
-        if end_date:
-            filtered_df = filtered_df[filtered_df['date'] <= end_date]
-            self.logger.info(f"Filtered to dates <= {end_date}: {len(filtered_df)} records")
-        
-        return filtered_df
+        for contract, group in data.groupby('contract'):
+            result[contract] = group.copy()
+            self.logger.info(f"Split {contract} data: {len(group)} rows")
+            
+        return result

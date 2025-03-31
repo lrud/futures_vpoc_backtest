@@ -1,15 +1,33 @@
 import numpy as np
 import pandas as pd
+import torch
 from src.utils.logging import get_logger
 from src.config.settings import settings
+
+logger = get_logger(__name__)
 
 class VolumeProfileAnalyzer:
     """Handles volume profile analysis, VPOC, and value area calculations."""
     
-    def __init__(self, price_precision=None):
+    def __init__(self, price_precision=None, device='cuda', device_ids=None):
         self.logger = get_logger(__name__)
         self.price_precision = price_precision or settings.PRICE_PRECISION
-        self.logger.info(f"Initialized VolumeProfileAnalyzer with precision {self.price_precision}")
+        
+        # Handle multi-GPU setup
+        if torch.cuda.is_available():
+            if device_ids and len(device_ids) > 1:
+                self.device = f'cuda:{device_ids[0]}'  # Primary device
+                self.parallel = True
+                self.device_ids = device_ids
+            else:
+                self.device = device
+                self.parallel = False
+        else:
+            self.device = 'cpu'
+            self.parallel = False
+            
+        self.logger.info(f"Initialized VolumeProfileAnalyzer with precision {self.price_precision} on {self.device}" + 
+                        (f" using devices {device_ids}" if self.parallel else ""))
     
     def calculate_volume_profile(self, session_df):
         """
@@ -27,66 +45,142 @@ class VolumeProfileAnalyzer:
         """
         self.logger.debug(f"Calculating volume profile for session with {len(session_df)} bars")
         
-        # Find min and max prices
-        min_price = min(session_df['low'].min(), session_df['open'].min(), session_df['close'].min())
-        max_price = max(session_df['high'].max(), session_df['open'].max(), session_df['close'].max())
+        # Convert to PyTorch tensors on GPU
+        try:
+            # Get OHLCV data as tensors
+            if self.parallel:
+                # Use DataParallel for multi-GPU
+                open_prices = torch.tensor(session_df['open'].values).to(self.device)
+                high_prices = torch.tensor(session_df['high'].values).to(self.device)
+                low_prices = torch.tensor(session_df['low'].values).to(self.device)
+                close_prices = torch.tensor(session_df['close'].values).to(self.device)
+                volumes = torch.tensor(session_df['volume'].values).to(self.device)
+                
+                # Replicate tensors across GPUs
+                open_prices = torch.nn.parallel.replicate(open_prices, self.device_ids)
+                high_prices = torch.nn.parallel.replicate(high_prices, self.device_ids)
+                low_prices = torch.nn.parallel.replicate(low_prices, self.device_ids)
+                close_prices = torch.nn.parallel.replicate(close_prices, self.device_ids)
+                volumes = torch.nn.parallel.replicate(volumes, self.device_ids)
+            else:
+                # Single GPU
+                open_prices = torch.tensor(session_df['open'].values, device=self.device)
+                high_prices = torch.tensor(session_df['high'].values, device=self.device)
+                low_prices = torch.tensor(session_df['low'].values, device=self.device)
+                close_prices = torch.tensor(session_df['close'].values, device=self.device)
+                volumes = torch.tensor(session_df['volume'].values, device=self.device)
 
-        # Round to nearest tick
-        min_price = np.floor(min_price / self.price_precision) * self.price_precision
-        max_price = np.ceil(max_price / self.price_precision) * self.price_precision
+            # Find min and max prices
+            if self.parallel:
+                # Multi-GPU version
+                min_price = min(
+                    torch.min(torch.cat([t.min().unsqueeze(0) for t in low_prices])),
+                    torch.min(torch.cat([t.min().unsqueeze(0) for t in open_prices])),
+                    torch.min(torch.cat([t.min().unsqueeze(0) for t in close_prices]))
+                )
+                max_price = max(
+                    torch.max(torch.cat([t.max().unsqueeze(0) for t in high_prices])),
+                    torch.max(torch.cat([t.max().unsqueeze(0) for t in open_prices])),
+                    torch.max(torch.cat([t.max().unsqueeze(0) for t in close_prices]))
+                )
+            else:
+                # Single GPU version
+                min_price = min(low_prices.min(), open_prices.min(), close_prices.min())
+                max_price = max(high_prices.max(), open_prices.max(), close_prices.max())
 
-        # Create price bins
-        price_bins = np.arange(min_price, max_price + self.price_precision, self.price_precision)
+            # Round to nearest tick
+            min_price = torch.floor(min_price / self.price_precision) * self.price_precision
+            max_price = torch.ceil(max_price / self.price_precision) * self.price_precision
 
-        # Create empty volume profile - using float64 instead of int for volume
-        volume_profile = pd.DataFrame({
-            'price_level': price_bins,
-            'volume': 0.0  # Initialize with float instead of int
-        })
+            # Create price bins on GPU
+            price_bins = torch.arange(min_price, max_price + self.price_precision, 
+                                    self.price_precision, device=self.device)
 
-        # Improved volume distribution across price levels within each bar
-        for _, row in session_df.iterrows():
-            # Calculate price range for the bar
-            bar_min = min(row['low'], row['open'], row['close'])
-            bar_max = max(row['high'], row['open'], row['close'])
+            # Initialize volume profile on GPU
+            volume_profile = torch.zeros_like(price_bins)
 
-            # Find bins that fall within this bar's range
-            mask = (volume_profile['price_level'] >= bar_min) & (volume_profile['price_level'] <= bar_max)
+            def process_bar(i):
+                """Process a single bar (helper function for parallel processing)"""
+                if self.parallel:
+                    bar_min = min(
+                        low_prices[i % len(self.device_ids)][i],
+                        open_prices[i % len(self.device_ids)][i],
+                        close_prices[i % len(self.device_ids)][i]
+                    )
+                    bar_max = max(
+                        high_prices[i % len(self.device_ids)][i],
+                        open_prices[i % len(self.device_ids)][i],
+                        close_prices[i % len(self.device_ids)][i]
+                    )
+                else:
+                    bar_min = min(low_prices[i], open_prices[i], close_prices[i])
+                    bar_max = max(high_prices[i], open_prices[i], close_prices[i])
 
-            # Count how many bins are in this range
-            bins_count = mask.sum()
+                mask = (price_bins >= bar_min) & (price_bins <= bar_max)
+                price_points = price_bins[mask]
 
-            if bins_count > 0:
-                # Get price points within the bar
-                price_points = volume_profile.loc[mask, 'price_level'].values
+                if len(price_points) > 0:
+                    weights = torch.ones(len(price_points), device=self.device)
+                    prices = [
+                        open_prices[i % len(self.device_ids)][i] if self.parallel else open_prices[i],
+                        high_prices[i % len(self.device_ids)][i] if self.parallel else high_prices[i],
+                        low_prices[i % len(self.device_ids)][i] if self.parallel else low_prices[i],
+                        close_prices[i % len(self.device_ids)][i] if self.parallel else close_prices[i]
+                    ]
+                    
+                    for price in prices:
+                        distance = torch.abs(price_points - price)
+                        proximity_weight = 1.0 / (1.0 + distance)
+                        weights += proximity_weight
 
-                # Create a weighted distribution based on proximity to OHLC prices
-                weights = np.ones(len(price_points))
+                    weights = weights / weights.sum()
+                    vol = volumes[i % len(self.device_ids)][i] if self.parallel else volumes[i]
+                    return mask, weights * vol
+                return None, None
 
-                # Add more weight to levels near open, high, low, and close
-                for price in [row['open'], row['high'], row['low'], row['close']]:
-                    # Add extra weight inversely proportional to distance from price
-                    distance = np.abs(price_points - price)
-                    proximity_weight = 1.0 / (1.0 + distance)
-                    weights += proximity_weight
+            # Process all bars in parallel
+            results = []
+            if self.parallel:
+                # Distribute work across GPUs
+                inputs = [(i,) for i in range(len(session_df))]
+                results = torch.nn.parallel.parallel_apply(
+                    [process_bar]*len(inputs), 
+                    inputs,
+                    devices=self.device_ids
+                )
+            else:
+                # Single GPU processing
+                for i in range(len(session_df)):
+                    mask, weighted_vol = process_bar(i)
+                    if mask is not None:
+                        volume_profile[mask] += weighted_vol
 
-                # Normalize weights to sum to 1
-                weights = weights / weights.sum()
+            # Combine results from multiple GPUs
+            if self.parallel:
+                for mask, weighted_vol in results:
+                    if mask is not None:
+                        volume_profile[mask] += weighted_vol.to(self.device)
 
-                # Distribute volume according to weights
-                weighted_volume = weights * row['volume']
+            # Apply smoothing on GPU
+            volume_profile_smooth = torch.zeros_like(volume_profile)
+            for i in range(len(volume_profile)):
+                start = max(0, i-1)
+                end = min(len(volume_profile), i+2)
+                volume_profile_smooth[i] = volume_profile[start:end].mean()
 
-                # Add to volume profile
-                for i, price_level in enumerate(price_points):
-                    idx = volume_profile.index[volume_profile['price_level'] == price_level].tolist()
-                    if idx:
-                        volume_profile.loc[idx[0], 'volume'] += weighted_volume[i]
+            # Convert back to pandas DataFrame
+            volume_profile_df = pd.DataFrame({
+                'price_level': price_bins.cpu().numpy(),
+                'volume': volume_profile.cpu().numpy(),
+                'volume_smooth': volume_profile_smooth.cpu().numpy()
+            })
 
-        # Apply smoothing to reduce noise
-        volume_profile['volume_smooth'] = volume_profile['volume'].rolling(window=3, center=True).mean()
-        volume_profile['volume_smooth'] = volume_profile['volume_smooth'].fillna(volume_profile['volume'])
+            return volume_profile_df
 
-        return volume_profile
+        except Exception as e:
+            self.logger.error(f"GPU volume profile calculation failed: {str(e)}")
+            self.logger.info("Falling back to CPU implementation")
+            return self._calculate_volume_profile_cpu(session_df)
     
     def find_vpoc(self, volume_profile, use_smoothing=True):
         """
@@ -196,6 +290,54 @@ class VolumeProfileAnalyzer:
 
         return val, vah, va_volume_pct
     
+    def _calculate_volume_profile_cpu(self, session_df):
+        """Fallback CPU implementation of volume profile calculation"""
+        self.logger.debug("Using CPU implementation for volume profile")
+        
+        # Find min and max prices
+        min_price = min(session_df['low'].min(), session_df['open'].min(), session_df['close'].min())
+        max_price = max(session_df['high'].max(), session_df['open'].max(), session_df['close'].max())
+
+        # Round to nearest tick
+        min_price = np.floor(min_price / self.price_precision) * self.price_precision
+        max_price = np.ceil(max_price / self.price_precision) * self.price_precision
+
+        # Create price bins
+        price_bins = np.arange(min_price, max_price + self.price_precision, self.price_precision)
+
+        # Create empty volume profile
+        volume_profile = pd.DataFrame({
+            'price_level': price_bins,
+            'volume': 0.0
+        })
+
+        # Improved volume distribution
+        for _, row in session_df.iterrows():
+            bar_min = min(row['low'], row['open'], row['close'])
+            bar_max = max(row['high'], row['open'], row['close'])
+            mask = (volume_profile['price_level'] >= bar_min) & (volume_profile['price_level'] <= bar_max)
+            price_points = volume_profile.loc[mask, 'price_level'].values
+
+            if len(price_points) > 0:
+                weights = np.ones(len(price_points))
+                for price in [row['open'], row['high'], row['low'], row['close']]:
+                    distance = np.abs(price_points - price)
+                    proximity_weight = 1.0 / (1.0 + distance)
+                    weights += proximity_weight
+
+                weights = weights / weights.sum()
+                weighted_volume = weights * row['volume']
+                for i, price_level in enumerate(price_points):
+                    idx = volume_profile.index[volume_profile['price_level'] == price_level].tolist()
+                    if idx:
+                        volume_profile.loc[idx[0], 'volume'] += weighted_volume[i]
+
+        # Apply smoothing
+        volume_profile['volume_smooth'] = volume_profile['volume'].rolling(window=3, center=True).mean()
+        volume_profile['volume_smooth'] = volume_profile['volume_smooth'].fillna(volume_profile['volume'])
+
+        return volume_profile
+
     def analyze_session(self, session_df):
         """
         Analyze a complete trading session and return all relevant metrics.
@@ -225,3 +367,66 @@ class VolumeProfileAnalyzer:
             'volume_profile': volume_profile,
             'total_volume': session_df['volume'].sum()
         }
+
+# Function wrappers for backward compatibility and convenience
+def calculate_volume_profile(session_data: pd.DataFrame, price_precision: float = 0.25) -> dict:
+    """Wrapper for VolumeProfileAnalyzer.calculate_volume_profile for backward compatibility"""
+    analyzer = VolumeProfileAnalyzer(price_precision=price_precision)
+    vol_profile_df = analyzer.calculate_volume_profile(session_data)
+    # Convert DataFrame to dictionary format used by legacy code
+    return {row['price_level']: row['volume'] for _, row in vol_profile_df.iterrows()}
+    
+def find_vpoc(volume_profile):
+    """Wrapper for backward compatibility - accepts either DataFrame or dict format"""
+    if isinstance(volume_profile, pd.DataFrame):
+        analyzer = VolumeProfileAnalyzer()
+        return analyzer.find_vpoc(volume_profile)
+    elif isinstance(volume_profile, dict):
+        # Handle dictionary format for legacy code
+        if not volume_profile:
+            logger.warning("Empty volume profile provided")
+            return 0.0
+        return max(volume_profile.items(), key=lambda x: x[1])[0]
+    else:
+        logger.error(f"Unsupported volume profile type: {type(volume_profile)}")
+        return 0.0
+    
+def find_value_area(volume_profile, value_area_pct: float = 0.7):
+    """Wrapper for backward compatibility - accepts either DataFrame or dict format"""
+    if isinstance(volume_profile, pd.DataFrame):
+        analyzer = VolumeProfileAnalyzer()
+        return analyzer.find_value_area(volume_profile, value_area_pct)
+    elif isinstance(volume_profile, dict):
+        # Handle dictionary format for legacy code
+        if not volume_profile:
+            logger.warning("Empty volume profile provided")
+            return 0.0, 0.0, 0.0
+            
+        # Sort price levels by volume (highest first)
+        sorted_levels = sorted(volume_profile.items(), key=lambda x: x[1], reverse=True)
+        
+        # Calculate total volume
+        total_volume = sum(volume_profile.values())
+        target_volume = total_volume * value_area_pct
+        
+        # Initialize
+        cumulative_volume = 0
+        included_prices = []
+        
+        # Add levels until we reach target volume
+        for price, volume in sorted_levels:
+            cumulative_volume += volume
+            included_prices.append(price)
+            
+            if cumulative_volume >= target_volume:
+                break
+                
+        # Find Value Area boundaries
+        val = min(included_prices)
+        vah = max(included_prices)
+        actual_pct = cumulative_volume / total_volume
+        
+        return val, vah, actual_pct
+    else:
+        logger.error(f"Unsupported volume profile type: {type(volume_profile)}")
+        return 0.0, 0.0, 0.0

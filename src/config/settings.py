@@ -1,6 +1,10 @@
-from pathlib import Path
+"""
+Global settings and configuration for the futures VPOC project.
+Provides a centralized place for all configuration values.
+"""
+
 import os
-import yaml
+from pathlib import Path
 
 class Settings:
     def __init__(self, config_file=None):
@@ -30,35 +34,48 @@ class Settings:
         self.MAX_POSITION_SIZE = 10
         self.MIN_CAPITAL_BUFFER = 0.2
         
-        # ML settings
-        self.LOOKBACK_PERIODS = [10, 20, 50]
+        # ML Parameters
+        self.DEFAULT_LOOKBACK_PERIODS = [5, 10, 20, 50]
+        self.DEFAULT_PREDICTION_THRESHOLD = 0.5
+        self.DEFAULT_CONFIDENCE_THRESHOLD = 70
         
-        # Load from config file if provided
+        # Override with config file if provided
         if config_file and os.path.exists(config_file):
-            self._load_from_yaml(config_file)
+            self._load_config(config_file)
         
-        # Create directories
-        self._ensure_directories_exist()
+        # Create directories if they don't exist
+        self._create_directories()
     
-    def _load_from_yaml(self, config_file):
-        with open(config_file, 'r') as f:
-            config = yaml.safe_load(f)
+    def _load_config(self, config_file):
+        """Load configuration from file."""
+        try:
+            import json
+            with open(config_file, 'r') as f:
+                config = json.load(f)
+                
+            # Update settings from config
             for key, value in config.items():
-                setattr(self, key, value)
+                if hasattr(self, key.upper()):
+                    setattr(self, key.upper(), value)
+                    
+        except Exception as e:
+            print(f"Error loading configuration: {e}")
     
-    def _ensure_directories_exist(self):
-        # Create necessary directories
-        for directory in [
+    def _create_directories(self):
+        """Create necessary directories."""
+        directories = [
             self.DATA_DIR, 
-            self.CLEANED_DATA_DIR,
+            self.CLEANED_DATA_DIR, 
             self.RESULTS_DIR,
             self.STRATEGY_DIR,
             self.BACKTEST_DIR,
             self.TRAINING_DIR
-        ]:
+        ]
+        
+        for directory in directories:
             os.makedirs(directory, exist_ok=True)
 
-# Create a global settings instance
+# Create global settings instance
 settings = Settings()
 
 # Export variables to make them importable at the module level
@@ -80,4 +97,6 @@ MARGIN_REQUIREMENT = settings.MARGIN_REQUIREMENT
 OVERNIGHT_MARGIN = settings.OVERNIGHT_MARGIN
 MAX_POSITION_SIZE = settings.MAX_POSITION_SIZE
 MIN_CAPITAL_BUFFER = settings.MIN_CAPITAL_BUFFER
-LOOKBACK_PERIODS = settings.LOOKBACK_PERIODS
+LOOKBACK_PERIODS = settings.DEFAULT_LOOKBACK_PERIODS
+DEFAULT_PREDICTION_THRESHOLD = settings.DEFAULT_PREDICTION_THRESHOLD
+DEFAULT_CONFIDENCE_THRESHOLD = settings.DEFAULT_CONFIDENCE_THRESHOLD

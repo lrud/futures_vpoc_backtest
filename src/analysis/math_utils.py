@@ -1,325 +1,387 @@
 """
-Mathematical analysis utilities for VPOC strategy.
-Provides statistical validation and probability estimation.
+Mathematical analysis utilities for trading strategies.
+Provides statistical validation, Monte Carlo simulations, and other mathematical tools.
 """
 
 import numpy as np
 import pandas as pd
+from typing import Dict, List, Tuple, Optional, Union
+import matplotlib.pyplot as plt
 import os
-from typing import Dict, List, Optional, Tuple, Union
-from scipy import stats
 from datetime import datetime
+import scipy.stats as stats
 
 from src.utils.logging import get_logger
 
+logger = get_logger(__name__)
 
-class VPOCMathAnalyzer:
+def validate_trend(values: List[float], dates: List, lookback: int = 20) -> Dict:
     """
-    Mathematical analysis for Volume Point of Control (VPOC) data.
+    Validate if there's a statistically significant trend.
+    
+    Parameters:
+    -----------
+    values: List[float]
+        List of numerical values to analyze
+    dates: List
+        Corresponding dates
+    lookback: int
+        Number of periods to look back
+        
+    Returns:
+    --------
+    Dict
+        Trend validation results
     """
-    
-    def __init__(self, output_dir=None):
-        """
-        Initialize the math analyzer.
-        
-        Args:
-            output_dir: Directory to save analysis results
-        """
-        self.logger = get_logger(__name__)
-        
-        # Get output directory from settings or use default
-        if output_dir is None:
-            try:
-                from src.config.settings import settings
-                self.output_dir = getattr(settings, 'MATH_OUTPUT_DIR', 
-                                         os.path.join(os.getcwd(), 'MATH_ANALYSIS'))
-            except (ImportError, AttributeError):
-                self.output_dir = os.path.join(os.getcwd(), 'MATH_ANALYSIS')
-        else:
-            self.output_dir = output_dir
-            
-        # Create output directory if it doesn't exist
-        os.makedirs(self.output_dir, exist_ok=True)
-        
-        self.logger.info(f"Initialized VPOCMathAnalyzer with output_dir: {self.output_dir}")
-    
-    def validate_vpoc_trend(self, vpocs: List[float], dates: List[datetime], 
-                          lookback: int = 20) -> Dict[str, any]:
-        """
-        Validate VPOC trend using statistical methods.
-        
-        Args:
-            vpocs: List of VPOC prices
-            dates: List of corresponding dates
-            lookback: Number of days to analyze for trend
-            
-        Returns:
-            Dictionary with trend validation results
-        """
-        self.logger.info(f"Validating VPOC trend with lookback={lookback}")
-        
-        # Check for sufficient data points
-        if len(vpocs) < 5:
-            self.logger.warning("Insufficient data for trend validation (minimum 5 points required)")
-            return {
-                'valid_trend': False,
-                'p_value': None,
-                'direction': None,
-                'consecutive_count': 0,
-                'confidence': 0,
-                'slope': None,
-                'r_squared': None
-            }
-        
-        # Use as many data points as available, up to lookback limit
-        recent_vpocs = vpocs[-min(lookback, len(vpocs)):]
-        recent_dates = dates[-min(lookback, len(vpocs)):]
-        
-        # Calculate price differences and determine trend direction
-        diffs = [recent_vpocs[i] - recent_vpocs[i-1] for i in range(1, len(recent_vpocs))]
-        pos_moves = sum(1 for d in diffs if d > 0)
-        neg_moves = sum(1 for d in diffs if d < 0)
-        zero_moves = sum(1 for d in diffs if d == 0)
-        
-        # Determine trend direction based on majority of moves
-        direction = 'up' if pos_moves > neg_moves else 'down' if neg_moves > pos_moves else 'neutral'
-        
-        # Find consecutive moves (streaks)
-        current_up_streak = 0
-        current_down_streak = 0
-        max_up_streak = 0
-        max_down_streak = 0
-        
-        for diff in diffs:
-            if diff > 0:
-                current_up_streak += 1
-                current_down_streak = 0
-                max_up_streak = max(max_up_streak, current_up_streak)
-            elif diff < 0:
-                current_down_streak += 1
-                current_up_streak = 0
-                max_down_streak = max(max_down_streak, current_down_streak)
-            else:  # diff == 0 (No change)
-                # Consider no change as continuing the current streak
-                pass
-        
-        # Linear regression for trend strength
-        x = np.arange(len(recent_vpocs))
-        y = np.array(recent_vpocs)
-        slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
-        r_squared = r_value ** 2
-        
-        # Run test for randomness
-        median = np.median(recent_vpocs)
-        runs = [1 if v > median else 0 for v in recent_vpocs]
-        runs_count = 1  # Initialize run count to 1
-        
-        for i in range(1, len(runs)):
-            if runs[i] != runs[i-1]:  # Check for change in run sequence
-                runs_count += 1
-        
-        n1 = sum(runs)
-        n2 = len(runs) - n1
-        expected_runs = (2 * n1 * n2) / (n1 + n2) + 1
-        std_runs = np.sqrt((2 * n1 * n2 * (2 * n1 * n2 - n1 - n2)) / 
-                         ((n1 + n2)**2 * (n1 + n2 - 1)))
-        
-        run_test_p = 2 * (1 - stats.norm.cdf(abs((runs_count - expected_runs) / std_runs))) if std_runs > 0 else 1.0
-        
-        # Relaxed criteria for trend validation
-        is_valid_trend = (
-            (p_value < 0.1) and          # More lenient p-value threshold
-            (r_squared > 0.2) and        # Lower R-squared requirement
-            (                            # Reduced consecutive moves requirement
-                (direction == 'up' and max_up_streak >= 2) or
-                (direction == 'down' and max_down_streak >= 2)
-            )
-        )
-        
-        # Alternative validation for strong consecutive moves
-        if not is_valid_trend and ((max_up_streak >= 3) or (max_down_streak >= 3)):
-            is_valid_trend = True
-        
-        # If trend is not valid but we have directional bias, still set direction
-        if not is_valid_trend and direction == 'neutral':
-            direction = 'up' if slope > 0 else 'down'
-        
-        # Calculate confidence score
-        if is_valid_trend:
-            trend_strength = min(r_squared * 100, 100)
-            statistical_significance = (1 - min(p_value, 0.5) * 2) * 100
-            streak_factor = (max(max_up_streak, max_down_streak) / 5) * 100
-            confidence = (trend_strength + statistical_significance + streak_factor) / 3
-        else:
-            # Assign some confidence even without full validation
-            consecutive_factor = max(max_up_streak, max_down_streak) * 10
-            confidence = min(consecutive_factor, 50)
-        
-        # Create result dictionary
-        result = {
-            'valid_trend': is_valid_trend,
-            'p_value': p_value,
-            'run_test_p': run_test_p,
-            'direction': direction,
-            'consecutive_up': max_up_streak,
-            'consecutive_down': max_down_streak,
-            'confidence': confidence,
-            'slope': slope,
-            'r_squared': r_squared
+    # Ensure we have enough data
+    if len(values) < lookback:
+        logger.warning(f"Not enough data for trend validation: {len(values)} < {lookback}")
+        return {
+            'valid_trend': False,
+            'p_value': 1.0,
+            'run_test_p': 1.0,
+            'direction': 'neutral',
+            'consecutive_up': 0,
+            'consecutive_down': 0,
+            'confidence': 0,
+            'slope': 0,
+            'r_squared': 0
         }
         
-        self.logger.info(f"Trend validation result: {direction} trend, " +
-                       f"confidence={confidence:.1f}%, valid={is_valid_trend}")
-        
-        return result
+    # Use recent data based on lookback
+    recent_values = values[-lookback:]
+    recent_dates = dates[-lookback:]
     
-    def momentum_analysis(self, vpoc_data: pd.DataFrame, window: int = 10) -> pd.DataFrame:
-        """
-        Calculate rolling window momentum for VPOC movements.
-        
-        Args:
-            vpoc_data: DataFrame with VPOC data
-            window: Size of rolling window
-            
-        Returns:
-            DataFrame with momentum metrics
-        """
-        self.logger.info(f"Performing momentum analysis with window={window}")
-        
-        if vpoc_data.empty:
-            self.logger.warning("Empty DataFrame provided for momentum analysis")
-            return pd.DataFrame()
-        
-        if 'vpoc' not in vpoc_data.columns:
-            self.logger.error("Required column 'vpoc' not found in DataFrame")
-            return pd.DataFrame()
-        
-        momentums = []
-        
-        for i in range(len(vpoc_data) - window):
-            try:
-                subset = vpoc_data.iloc[i:i+window]
-                x = np.arange(len(subset))
-                y = subset['vpoc'].values
-                
-                # Data validation
-                if len(set(y)) < 2:
-                    continue
-                    
-                slope, _, r_value, p_value, _ = stats.linregress(x, y)
-                
-                # Normalize momentum
-                std_dev = np.std(y)
-                normalized_momentum = slope / std_dev if std_dev != 0 else 0
-                
-                # Store result
-                momentums.append({
-                    'date': subset.index[-1] if isinstance(subset.index, pd.DatetimeIndex) else subset.iloc[-1]['date'],
-                    'window_momentum': normalized_momentum,
-                    'window_confidence': r_value**2,
-                    'window_significance': 1 - p_value
-                })
-            except Exception as e:
-                self.logger.error(f"Error in momentum calculation: {str(e)}")
-                continue
-        
-        return pd.DataFrame(momentums)
+    # Calculate consecutive moves
+    diffs = np.diff(recent_values)
+    current_up_streak = 0
+    current_down_streak = 0
+    max_up_streak = 0
+    max_down_streak = 0
     
-    def bayesian_probability_estimation(self, vpoc_data: pd.DataFrame) -> Dict[str, float]:
-        """
-        Calculate Bayesian probability of VPOC movement direction.
-        
-        Args:
-            vpoc_data: DataFrame with VPOC data
+    for diff in diffs:
+        if diff > 0:
+            current_up_streak += 1
+            current_down_streak = 0
+            max_up_streak = max(max_up_streak, current_up_streak)
+        elif diff < 0:
+            current_down_streak += 1
+            current_up_streak = 0
+            max_down_streak = max(max_down_streak, current_down_streak)
             
-        Returns:
-            Dictionary with probability estimates
-        """
-        self.logger.info("Calculating Bayesian probability estimates")
-        
-        if vpoc_data.empty or 'vpoc' not in vpoc_data.columns:
-            self.logger.warning("Invalid data for Bayesian analysis")
-            return {'probability_up': 0.5, 'probability_down': 0.5}
-        
-        try:
-            # Calculate price changes with exponential weighting for recency
-            price_changes = vpoc_data['vpoc'].diff().dropna()
-            
-            if len(price_changes) == 0:
-                return {'probability_up': 0.5, 'probability_down': 0.5}
-            
-            # Create exponential weights (more recent = higher weight)
-            weights = np.exp(np.linspace(-1, 0, len(price_changes)))
-            
-            # Weight recent moves more heavily
-            positive_mask = price_changes > 0
-            negative_mask = price_changes < 0
-            
-            positive_moves = price_changes[positive_mask]
-            negative_moves = price_changes[negative_mask]
-            
-            # Align weights with the masks
-            positive_weights = weights[-len(positive_moves):] if len(positive_moves) > 0 else []
-            negative_weights = weights[-len(negative_moves):] if len(negative_moves) > 0 else []
-            
-            # Calculate weighted probabilities
-            weighted_positive = np.sum(np.abs(positive_moves) * positive_weights) if len(positive_moves) > 0 else 0
-            weighted_negative = np.sum(np.abs(negative_moves) * negative_weights) if len(negative_moves) > 0 else 0
-            
-            total_weighted = weighted_positive + weighted_negative
-            
-            prob_up = weighted_positive / total_weighted if total_weighted > 0 else 0.5
-            
-            return {
-                'probability_up': prob_up,
-                'probability_down': 1 - prob_up
-            }
-            
-        except Exception as e:
-            self.logger.error(f"Error in Bayesian analysis: {str(e)}")
-            return {
-                'probability_up': 0.5,
-                'probability_down': 0.5
-            }
+    # Linear regression for trend strength
+    x = np.arange(len(recent_values))
+    y = np.array(recent_values)
+    slope, intercept, r_value, p_value, std_err = stats.linregress(x, y)
+    r_squared = r_value ** 2
+    direction = 'up' if slope > 0 else 'down'
     
-    def save_analysis(self, analysis_results: Dict[str, any], filename: str = None) -> str:
-        """
-        Save analysis results to a CSV file.
+    # Runs test for randomness
+    median_value = np.median(recent_values)
+    runs = [1 if v > median_value else 0 for v in recent_values]
+    runs_count = 1
+    
+    for i in range(1, len(runs)):
+        if runs[i] != runs[i-1]:
+            runs_count += 1
+            
+    # Calculate expected runs and standard deviation
+    n1 = runs.count(1)
+    n2 = runs.count(0)
+    expected_runs = (2 * n1 * n2) / (n1 + n2) + 1 if (n1 + n2) > 0 else 0
+    std_runs_denominator = ((n1 + n2)**2 * (n1 + n2 - 1))
+    std_runs = np.sqrt((2 * n1 * n2 * (2 * n1 * n2 - n1 - n2)) / 
+                       std_runs_denominator) if std_runs_denominator > 0 else 0
+                       
+    # Run test p-value
+    run_test_p = 2 * (1 - stats.norm.cdf(abs((runs_count - expected_runs) / std_runs))) if std_runs > 0 else 1.0
+    
+    # Trend validation criteria
+    is_valid_trend = (
+        (p_value < 0.1) and          # More lenient p-value threshold
+        (r_squared > 0.2) and        # Lower R-squared requirement
+        (                            # Reduced consecutive moves requirement
+            (direction == 'up' and max_up_streak >= 2) or
+            (direction == 'down' and max_down_streak >= 2)
+        )
+    )
+    
+    # Alternative validation if basic conditions are met
+    if not is_valid_trend and ((max_up_streak >= 3) or (max_down_streak >= 3)):
+        is_valid_trend = True  # Valid if we have at least 3 consecutive moves
         
-        Args:
-            analysis_results: Dictionary of analysis results
-            filename: Custom filename for output
-            
-        Returns:
-            Path to the saved file
-        """
-        if not filename:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f'vpoc_analysis_{timestamp}.csv'
+    # Calculate confidence
+    if is_valid_trend:
+        trend_strength = min(r_squared * 100, 100)  # R-squared as percentage
+        statistical_significance = (1 - min(p_value, 0.5) * 2) * 100  # Convert p-value to confidence
+        streak_factor = (max(max_up_streak, max_down_streak) / 5) * 100  # Streak factor
+        confidence = (trend_strength + statistical_significance + streak_factor) / 3  # Weighted average
+    else:
+        # Even without validation, assign some confidence based on direction strength
+        consecutive_factor = max(max_up_streak, max_down_streak) * 10  # 10% per consecutive move
+        confidence = min(consecutive_factor, 50)  # Cap at 50% if not fully validated
         
-        output_path = os.path.join(self.output_dir, filename)
+    return {
+        'valid_trend': is_valid_trend,
+        'p_value': p_value,
+        'run_test_p': run_test_p,
+        'direction': direction,
+        'consecutive_up': max_up_streak,
+        'consecutive_down': max_down_streak,
+        'confidence': confidence,
+        'slope': slope,
+        'r_squared': r_squared
+    }
+
+def monte_carlo_simulation(trade_results: List[Dict], 
+                          initial_capital: float = 100000, 
+                          iterations: int = 1000) -> Tuple[Dict, List[Dict]]:
+    """
+    Perform Monte Carlo simulation on trade results.
+    
+    Parameters:
+    -----------
+    trade_results: List[Dict]
+        List of trade result dictionaries with 'profit' key
+    initial_capital: float
+        Initial capital amount
+    iterations: int
+        Number of Monte Carlo iterations
         
-        try:
-            # Flatten dictionary for CSV output
-            flat_results = {}
-            for key, value in analysis_results.items():
-                if isinstance(value, dict):
-                    for subkey, subvalue in value.items():
-                        flat_results[f'{key}_{subkey}'] = subvalue
-                elif isinstance(value, pd.DataFrame):
-                    # Save DataFrame separately
-                    df_path = output_path.replace('.csv', f'_{key}.csv')
-                    value.to_csv(df_path, index=False)
-                    self.logger.info(f"Saved {key} data to {df_path}")
-                else:
-                    flat_results[key] = value
+    Returns:
+    --------
+    Tuple[Dict, List[Dict]]
+        Statistics and raw simulation results
+    """
+    if not trade_results:
+        logger.warning("No trade results provided for Monte Carlo simulation")
+        return {}, []
+        
+    # Extract profits from trades
+    profits = [trade['profit'] for trade in trade_results]
+    
+    # Run simulations
+    simulation_results = []
+    
+    for i in range(iterations):
+        # Shuffle profits randomly
+        np.random.shuffle(profits)
+        
+        # Calculate equity curve
+        equity = [initial_capital]
+        for profit in profits:
+            equity.append(equity[-1] + profit)
             
-            # Save flattened results to CSV
-            pd.DataFrame([flat_results]).to_csv(output_path, index=False)
-            self.logger.info(f"Analysis saved to {output_path}")
+        # Calculate returns and drawdowns
+        final_equity = equity[-1]
+        return_pct = (final_equity - initial_capital) / initial_capital * 100
+        
+        # Calculate drawdown
+        peak = initial_capital
+        drawdown = 0
+        
+        for eq in equity:
+            if eq > peak:
+                peak = eq
+            dd = (peak - eq) / peak * 100
+            drawdown = max(drawdown, dd)
             
-            return output_path
-            
-        except Exception as e:
-            self.logger.error(f"Error saving analysis results: {str(e)}")
-            return ""
+        # Store result
+        simulation_results.append({
+            'final_equity': final_equity,
+            'return_pct': return_pct,
+            'max_drawdown': drawdown,
+            'equity_curve': equity
+        })
+    
+    # Analyze results
+    final_equities = [r['final_equity'] for r in simulation_results]
+    returns_pct = [r['return_pct'] for r in simulation_results]
+    drawdowns = [r['max_drawdown'] for r in simulation_results]
+    
+    # Calculate confidence intervals
+    ci_level = 0.95
+    lower_ci_idx = int((1 - ci_level) / 2 * iterations)
+    upper_ci_idx = int((1 - (1 - ci_level) / 2) * iterations)
+    
+    sorted_returns = sorted(returns_pct)
+    sorted_drawdowns = sorted(drawdowns)
+    
+    # Compile statistics
+    results = {
+        'mean_return': np.mean(returns_pct),
+        'median_return': np.median(returns_pct),
+        'mean_drawdown': np.mean(drawdowns),
+        'median_drawdown': np.median(drawdowns),
+        'worst_drawdown': max(drawdowns),
+        'best_return': max(returns_pct),
+        'worst_return': min(returns_pct),
+        'return_ci_lower': sorted_returns[lower_ci_idx],
+        'return_ci_upper': sorted_returns[upper_ci_idx],
+        'drawdown_ci_lower': sorted_drawdowns[upper_ci_idx],
+        'drawdown_ci_upper': sorted_drawdowns[lower_ci_idx],
+        'probability_positive': sum(1 for r in returns_pct if r > 0) / iterations * 100
+    }
+    
+    return results, simulation_results
+
+def plot_monte_carlo_results(simulation_results: List[Dict], 
+                           initial_capital: float,
+                           ci_level: float = 0.95,
+                           output_path: Optional[str] = None) -> None:
+    """
+    Plot Monte Carlo simulation results.
+    
+    Parameters:
+    -----------
+    simulation_results: List[Dict]
+        Results from monte_carlo_simulation
+    initial_capital: float
+        Initial capital amount
+    ci_level: float
+        Confidence interval level (0-1)
+    output_path: Optional[str]
+        Path to save the visualization
+    """
+    if not simulation_results:
+        logger.warning("No simulation results to plot")
+        return
+        
+    # Extract equity curves
+    curves = [r['equity_curve'] for r in simulation_results]
+    
+    # Find shortest curve length (in case of varying trade counts)
+    min_length = min(len(c) for c in curves)
+    
+    # Trim all curves to shortest length
+    trimmed_curves = [c[:min_length] for c in curves]
+    
+    # Convert to numpy array for easier analysis
+    equity_array = np.array(trimmed_curves)
+    
+    # Calculate statistics for each point in time
+    median_curve = np.median(equity_array, axis=0)
+    lower_ci_idx = int((1 - ci_level) / 2 * len(curves))
+    upper_ci_idx = int((1 - (1 - ci_level) / 2) * len(curves))
+    
+    # Sort each time point to find percentiles
+    sorted_equities = np.sort(equity_array, axis=0)
+    lower_ci = sorted_equities[lower_ci_idx, :]
+    upper_ci = sorted_equities[upper_ci_idx, :]
+    
+    # Plot results
+    plt.figure(figsize=(12, 8))
+    
+    # Plot sample of individual paths (semi-transparent)
+    sample_size = min(100, len(curves))
+    indices = np.random.choice(len(curves), sample_size, replace=False)
+    
+    for idx in indices:
+        plt.plot(curves[idx], color='gray', alpha=0.1)
+    
+    # Plot confidence intervals and median
+    plt.plot(median_curve, color='blue', linewidth=2, label='Median Path')
+    plt.plot(lower_ci, color='red', linewidth=1, linestyle='--', 
+            label=f'Lower {ci_level*100:.0f}% CI')
+    plt.plot(upper_ci, color='green', linewidth=1, linestyle='--',
+            label=f'Upper {ci_level*100:.0f}% CI')
+    
+    # Add initial capital reference
+    plt.axhline(y=initial_capital, color='black', linestyle='-', alpha=0.5, 
+               label=f'Initial Capital (${initial_capital:,.0f})')
+    
+    # Labels and title
+    plt.title('Monte Carlo Simulation of Trading Strategy', fontsize=16)
+    plt.xlabel('Trade Number', fontsize=12)
+    plt.ylabel('Account Equity', fontsize=12)
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    
+    # Save or show
+    if output_path:
+        plt.savefig(output_path, dpi=300)
+        plt.close()
+        logger.info(f"Monte Carlo visualization saved to {output_path}")
+    else:
+        plt.show()
+
+def calculate_bayesian_probabilities(values: List[float], 
+                                   prior_up: float = 0.5,
+                                   lookback: int = 20) -> Dict[str, float]:
+    """
+    Calculate Bayesian probabilities for market direction.
+    
+    Parameters:
+    -----------
+    values: List[float]
+        List of price or other values
+    prior_up: float
+        Prior probability of upward move (0-1)
+    lookback: int
+        Number of periods to consider
+        
+    Returns:
+    --------
+    Dict[str, float]
+        Dictionary with probability estimates
+    """
+    if len(values) < lookback:
+        logger.warning(f"Not enough data for Bayesian analysis: {len(values)} < {lookback}")
+        return {
+            'probability_up': prior_up,
+            'probability_down': 1 - prior_up,
+            'confidence': 0.5
+        }
+        
+    # Get recent values and calculate changes
+    recent_values = values[-lookback:]
+    changes = np.diff(recent_values)
+    
+    # Count ups and downs
+    up_count = sum(1 for change in changes if change > 0)
+    down_count = sum(1 for change in changes if change < 0)
+    equal_count = sum(1 for change in changes if change == 0)
+    
+    # Calculate total observations (excluding equals)
+    total_obs = up_count + down_count
+    
+    if total_obs == 0:
+        return {
+            'probability_up': prior_up,
+            'probability_down': 1 - prior_up,
+            'confidence': 0.5
+        }
+    
+    # Calculate likelihood factors
+    up_pct = up_count / total_obs
+    down_pct = down_count / total_obs
+    
+    # Apply Bayes' rule
+    # P(Up|Data) = P(Data|Up) * P(Up) / P(Data)
+    # where P(Data) = P(Data|Up) * P(Up) + P(Data|Down) * P(Down)
+    
+    # Likelihood * Prior
+    up_posterior = up_pct * prior_up
+    down_posterior = down_pct * (1 - prior_up)
+    
+    # Normalize
+    total_posterior = up_posterior + down_posterior
+    
+    if total_posterior == 0:
+        probability_up = prior_up
+        probability_down = 1 - prior_up
+    else:
+        probability_up = up_posterior / total_posterior
+        probability_down = down_posterior / total_posterior
+    
+    # Calculate confidence based on sample size
+    confidence = min(1.0, total_obs / lookback)
+    
+    return {
+        'probability_up': probability_up,
+        'probability_down': probability_down,
+        'confidence': confidence,
+        'up_count': up_count,
+        'down_count': down_count,
+        'equal_count': equal_count
+    }
