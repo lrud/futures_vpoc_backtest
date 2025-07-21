@@ -1,7 +1,5 @@
 # ES Futures VPOC Strategy Backtester
 
-#DEPRECATED
-
 ## Overview
 Advanced algorithmic trading strategy for E-mini S&P 500 (ES) futures that combines Volume Point of Control (VPOC) analysis with statistical validation. The strategy identifies high-probability trading opportunities by analyzing volume distribution patterns, value area migrations, and market microstructure.
 
