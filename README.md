@@ -134,17 +134,17 @@ futures_vpoc_backtest/
 ## Installation & Usage
 
 ### 1. Setup Environment
-```bash setup.sh
+```bash
 # Clone repository and install dependencies
 git clone https://github.com/lrud/futures_vpoc_backtest.git
 cd futures_vpoc_backtest
 python -m venv venv
-source venv/bin/activate
+source venv/bin/activate  # On Windows: venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
 ### 2. Run Legacy Analysis Pipeline
-```bash run_legacy.sh
+```bash
 cd NOTEBOOKS
 python VPOC.py      # Volume profile calculations
 python MATH.py      # Statistical validation
@@ -154,27 +154,32 @@ python BACKTEST.py   # Performance backtesting
 ```
 
 ### 3. Use Refactored ML Components
-```python example_usage.py
+```python
 from src.core.data import FuturesDataManager
-from src.ml.train import start_training # Updated import
+from src.ml.train import main as train_main
+import sys
 
-# Example: Load data and start training
-# (Actual arguments might differ based on train.py implementation)
+# Example: Train ML model
+# Run training with default parameters
+sys.argv = ['train.py', '--epochs', '10', '--batch_size', '32']
+train_main()
+
+# Or load data and prepare features
 data_manager = FuturesDataManager()
-# Assuming start_training handles data loading or takes data path
-start_training(config_path='path/to/config.yaml') # Example call
+data = data_manager.load_futures_data()
+print(f"Loaded {len(data)} records")
 ```
 
 ### 4. Run Tests
-```bash run_tests.sh
-# Example unit tests (adjust based on actual test structure)
-python -m unittest src/scripts/test_backtest.py
-python -m unittest src/scripts/test_model.py
-python -m unittest src/tests/test_ml_backtest.py # New test file
-python -m unittest src/scripts/test_vix_features.py # New test file
+```bash
+# Run individual test files
+python src/scripts/test_backtest.py
+python src/scripts/test_model.py
+python src/scripts/test_vpoc.py
+python src/tests/test_ml_backtest.py
 
-# Example integration test
-python -m src.scripts.test_ML_total
+# Run integration test
+python src/scripts/test_ML_total.py
 ```
 
 ### Key Scripts
@@ -187,35 +192,16 @@ python -m src.scripts.test_ML_total
 
 ## Dependencies
 
-```text requirements.txt
-# Core Data & Math
-pandas==2.0.0                # src/core/data.py (data loading)
-numpy==1.24.0                # src/analysis/math_utils.py (calculations)
-scipy==1.10.0                # src/ml/feature_engineering.py (statistical features)
+### Key Dependencies:
+- **`torch`**: Used in `src/ml/model.py` and ML training pipeline for neural networks
+- **`pandas`**: Core data manipulation throughout the project
+- **`numpy`**: Numerical computations and array operations
+- **`pandas-ta`**: Technical analysis indicators in `NOTEBOOKS/STRATEGY.py`
+- **`scikit-learn`**: Feature selection and ML preprocessing utilities
+- **`matplotlib/seaborn`**: Visualization for backtest results and volume profiles
 
-# Machine Learning
-torch>=2.0.0                 # src/ml/model.py (PyTorch model)
-scikit-learn>=1.0.0          # src/ml/feature_engineering.py (feature selection)
-
-# Visualization
-matplotlib==3.7.0            # src/core/vpoc.py (volume profile plots)
-seaborn==0.12.2              # src/analysis/backtest.py (performance visuals)
-
-# Trading & Statistics
-pandas-ta==0.3.14b           # NOTEBOOKS/STRATEGY.py (technical indicators)
-statsmodels==0.14.0          # NOTEBOOKS/MATH.py (regression analysis)
-
-# Distributed Training
-mpi4py                       # src/ml/distributed_trainer.py (multi-GPU coordination)
-```
-
-### Key File Associations:
-- **`torch`**: Used in `src/ml/distributed_trainer.py` and other ML files for AMD GPU-optimized training.
-- **`pandas-ta`**: Legacy dependency in `NOTEBOOKS/STRATEGY.py` for TA-Lib wrappers.
-- **`mpi4py`**: Critical for `mp.spawn()` in distributed training (`src/ml/distributed_trainer.py`).
-
-To install:  
-```bash setup.sh
+To install:
+```bash
 pip install -r requirements.txt
 ```
 
