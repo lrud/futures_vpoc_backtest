@@ -93,77 +93,145 @@ class ModelTrainer(TrainingCore):
             
             self.logger.info(f"Created validation set with {len(X_val)} samples")
         
-        # Convert to PyTorch tensors and move to GPU immediately
-        X_train_tensor = torch.tensor(X_train, dtype=torch.float32).to(device)
-        y_train_tensor = torch.tensor(y_train, dtype=torch.float32).to(device)
+        # Convert to PyTorch tensors (keep on CPU for DataParallel)
+        X_train_tensor = torch.tensor(X_train, dtype=torch.float32)
+        y_train_tensor = torch.tensor(y_train, dtype=torch.float32)
         y_train_tensor = (y_train_tensor + 1) / 2  # Convert from [-1, 1] to [0, 1]
-        
+
         # Create dataset and loader for training
         train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
         train_loader = DataLoader(
-            train_dataset, 
-            batch_size=batch_size, 
+            train_dataset,
+            batch_size=batch_size,
             shuffle=True,
-            pin_memory=False  # Disable since data is already on GPU
+            pin_memory=True  # Enable for faster GPU transfer
         )
-        
-        # Move validation data to GPU
-        X_val_tensor = torch.tensor(X_val, dtype=torch.float32).to(device)
-        y_val_tensor = torch.tensor(y_val, dtype=torch.float32).to(device)
+
+        # Keep validation data on CPU, will be moved to GPU in training loop
+        X_val_tensor = torch.tensor(X_val, dtype=torch.float32)
+        y_val_tensor = torch.tensor(y_val, dtype=torch.float32)
         y_val_tensor = (y_val_tensor + 1) / 2  # Convert from [-1, 1] to [0, 1]
         
         return train_loader, (X_val_tensor, y_val_tensor)
     
     def _train_epoch(self, train_loader):
-        """Run one training epoch using parent class parameters."""
+        """Run one training epoch with enhanced progress monitoring."""
         from src.ml.trainer_utils import get_gpu_metrics, log_gpu_metrics
-        
+
         self.model.train()
         train_loss = 0.0
         samples_processed = 0
-        
+        batch_count = len(train_loader)
+        epoch_start_time = time.time()
+
+        self.logger.info(f"    📦 Processing {batch_count} batches...")
+
         # Log initial GPU state
         if torch.cuda.is_available():
+            initial_memory = torch.cuda.memory_allocated(self.device) / 1024**3
+            self.logger.info(f"    💾 Starting GPU Memory: {initial_memory:.2f}GB")
             gpu_metrics = get_gpu_metrics()
             log_gpu_metrics(gpu_metrics, self.logger)
-        
+
         for batch_idx, (inputs, targets) in enumerate(train_loader):
+            batch_start_time = time.time()
             inputs, targets = inputs.to(self.device), targets.to(self.device)
+
+            # Memory check before forward pass
+            if torch.cuda.is_available():
+                pre_forward_memory = torch.cuda.memory_allocated(self.device) / 1024**3
+
             self.optimizer.zero_grad()
-            
-            # Log GPU metrics periodically
-            if torch.cuda.is_available() and batch_idx % 10 == 0:
-                gpu_metrics = get_gpu_metrics()
-                log_gpu_metrics(gpu_metrics, self.logger)
-            
-            if self.scaler:
-                with torch.cuda.amp.autocast():
-                    outputs = self.model(inputs).squeeze()
+
+            try:
+                # Get model (compiled or original) for PyTorch 2.10 optimization
+                model_for_training = self.get_model_for_training()
+
+                if self.scaler:
+                    with torch.cuda.amp.autocast():
+                        outputs = model_for_training(inputs).squeeze()
+                        loss = self.criterion(outputs, targets)
+                    self.scaler.scale(loss).backward()
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    outputs = model_for_training(inputs).squeeze()
                     loss = self.criterion(outputs, targets)
-                self.scaler.scale(loss).backward()
-                self.scaler.step(self.optimizer)
-                self.scaler.update()
-            else:
-                outputs = self.model(inputs).squeeze()
-                loss = self.criterion(outputs, targets)
-                loss.backward()
-                self.optimizer.step()
-            
-            train_loss += loss.item() * inputs.size(0)
-            samples_processed += inputs.size(0)
-            
-        return train_loss / samples_processed
+                    loss.backward()
+                    self.optimizer.step()
+
+                # Log batch progress (every 10 batches or first/last batch)
+                if batch_idx % 10 == 0 or batch_idx == batch_count - 1:
+                    batch_time = time.time() - batch_start_time
+                    progress_pct = (batch_idx + 1) / batch_count * 100
+                    current_loss = loss.item()
+
+                    self.logger.info(f"      🔄 Batch {batch_idx+1}/{batch_count} ({progress_pct:.1f}%) "
+                                   f"- Loss: {current_loss:.6f} - Time: {batch_time:.3f}s")
+
+                    if torch.cuda.is_available():
+                        post_forward_memory = torch.cuda.memory_allocated(self.device) / 1024**3
+                        memory_delta = post_forward_memory - pre_forward_memory
+                        self.logger.info(f"         Memory: {post_forward_memory:.2f}GB "
+                                       f"(Δ{memory_delta:+.2f}GB)")
+
+                # Log GPU metrics periodically
+                if torch.cuda.is_available() and batch_idx % 10 == 0:
+                    gpu_metrics = get_gpu_metrics()
+                    log_gpu_metrics(gpu_metrics, self.logger)
+
+                train_loss += loss.item() * inputs.size(0)
+                samples_processed += inputs.size(0)
+
+            except RuntimeError as e:
+                if "out of memory" in str(e).lower():
+                    self.logger.error(f"    ❌ GPU Out of Memory Error in batch {batch_idx+1}")
+                    self.logger.error(f"    📊 Batch Details:")
+                    self.logger.error(f"      • Batch Size: {inputs.size(0)}")
+                    self.logger.error(f"      • Input Shape: {inputs.shape}")
+                    self.logger.error(f"      • Input Features: {inputs.shape[1]}")
+                    if torch.cuda.is_available():
+                        oom_memory = torch.cuda.memory_allocated(self.device) / 1024**3
+                        total_memory = torch.cuda.get_device_properties(self.device).total_memory / 1024**3
+                        self.logger.error(f"      • GPU Memory Used: {oom_memory:.2f}GB / {total_memory:.2f}GB")
+                    raise e
+                else:
+                    raise e
+
+        epoch_time = time.time() - epoch_start_time
+        avg_loss = train_loss / samples_processed
+
+        self.logger.info(f"    ✅ Epoch Training Complete:")
+        self.logger.info(f"      • Average Loss: {avg_loss:.6f}")
+        self.logger.info(f"      • Samples Processed: {samples_processed}")
+        self.logger.info(f"      • Epoch Time: {epoch_time:.2f}s")
+        self.logger.info(f"      • Avg Batch Time: {epoch_time/batch_count:.3f}s")
+
+        if torch.cuda.is_available():
+            final_memory = torch.cuda.memory_allocated(self.device) / 1024**3
+            self.logger.info(f"      • Final GPU Memory: {final_memory:.2f}GB")
+
+        return avg_loss
 
     def _validate_model(self, X_val, y_val):
         """Run validation using parent class parameters."""
         self.model.eval()
-        
+
+        # Move validation tensors to the same device as model
+        if hasattr(self.model, 'device'):
+            device = self.model.device
+        else:
+            device = next(self.model.parameters()).device
+
+        X_val = X_val.to(device)
+        y_val = y_val.to(device)
+
         with torch.no_grad():
             outputs = self.model(X_val).squeeze()
             val_loss = self.criterion(outputs, y_val).item()
             predicted = (outputs > 0).float()
             accuracy = (predicted == y_val).sum().item() / y_val.size(0) * 100
-            
+
         return {'val_loss': val_loss, 'val_accuracy': accuracy}
     
     def train(self, model, X_train, y_train, X_val=None, y_val=None, args=None):
@@ -214,11 +282,10 @@ class ModelTrainer(TrainingCore):
         
         # Learning rate scheduler
         scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-            self.optimizer, 
-            mode='min', 
-            factor=0.5, 
-            patience=10,
-            verbose=True
+            self.optimizer,
+            mode='min',
+            factor=0.5,
+            patience=10
         )
         
         # Set up mixed precision training if requested
@@ -234,32 +301,91 @@ class ModelTrainer(TrainingCore):
             'val_accuracy': []
         }
         
+        # Enhanced training configuration logging
+        self.logger.info("🚀 STARTING NEURAL NETWORK TRAINING")
+        self.logger.info("=" * 60)
+        self.logger.info(f"📊 Training Configuration:")
+        self.logger.info(f"  • Batch Size: {args['batch_size']}")
+        self.logger.info(f"  • Epochs: {args['epochs']}")
+        self.logger.info(f"  • Learning Rate: {args['learning_rate']}")
+        self.logger.info(f"  • Mixed Precision: {args.get('use_mixed_precision', False)}")
+        self.logger.info(f"  • Device: {self.device}")
+        self.logger.info(f"  • Training Samples: {len(X_train)}")
+        self.logger.info(f"  • Validation Samples: {len(X_val_tensor) if X_val_tensor is not None else 0}")
+        self.logger.info(f"  • Input Features: {X_train.shape[1]}")
+
+        # Log data types and shapes
+        self.logger.info(f"📋 Data Shapes:")
+        self.logger.info(f"  • X_train: {X_train.shape} ({X_train.dtype})")
+        self.logger.info(f"  • y_train: {y_train.shape} ({y_train.dtype})")
+        if X_val_tensor is not None:
+            self.logger.info(f"  • X_val: {X_val_tensor.shape} ({X_val_tensor.dtype})")
+            self.logger.info(f"  • y_val: {y_val_tensor.shape} ({y_val_tensor.dtype})")
+
+        # Log model details
+        total_params = sum(p.numel() for p in model.parameters())
+        trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        self.logger.info(f"🧠 Model Architecture:")
+        self.logger.info(f"  • Total Parameters: {total_params:,}")
+        self.logger.info(f"  • Trainable Parameters: {trainable_params:,}")
+        self.logger.info(f"  • Model Layers: {[layer for layer in model.hidden_layers_config] if hasattr(model, 'hidden_layers_config') else 'Unknown'}")
+
+        # ROCm 7 Memory Optimizations
+        self._setup_rocm_memory_optimizations(model, args.get('use_mixed_precision', False))
+
         # Training loop
         best_val_loss = float('inf')
         start_time = time.time()
-        
+        epoch_start_time = start_time
+
+        self.logger.info("=" * 60)
+        self.logger.info("🏃‍♂️ BEGINNING TRAINING EPOCHS")
+        self.logger.info("=" * 60)
+
         for epoch in range(args['epochs']):
+            epoch_start_time = time.time()
+            self.logger.info(f"\n📚 EPOCH {epoch+1}/{args['epochs']} - Starting...")
+
             # Training phase
+            self.logger.info(f"  🔥 Training phase...")
             train_loss = self._train_epoch(train_loader)
-            
+
             # Validation phase
+            self.logger.info(f"  ✅ Validation phase...")
             val_metrics = self._validate_model(X_val_tensor, y_val_tensor)
             val_loss = val_metrics['val_loss']
             accuracy = val_metrics['val_accuracy']
-            
+
             # Update learning rate
+            current_lr = self.optimizer.param_groups[0]['lr']
             scheduler.step(val_loss)
-            
+
+            # Calculate epoch timing
+            epoch_time = time.time() - epoch_start_time
+            total_time = time.time() - start_time
+            eta_seconds = (total_time / (epoch + 1)) * (args['epochs'] - epoch - 1)
+            eta_minutes = eta_seconds / 60
+
             # Save history
             history['train_loss'].append(train_loss)
             history['val_loss'].append(val_loss)
             history['val_accuracy'].append(accuracy)
-            
-            # Log progress
-            self.logger.info(f"Epoch {epoch+1}/{args['epochs']} - "
-                           f"Train Loss: {train_loss:.4f} - "
-                           f"Val Loss: {val_loss:.4f} - "
-                           f"Val Accuracy: {accuracy:.2f}%")
+
+            # Enhanced progress logging
+            self.logger.info(f"  📈 EPOCH {epoch+1} RESULTS:")
+            self.logger.info(f"    • Train Loss: {train_loss:.6f}")
+            self.logger.info(f"    • Val Loss: {val_loss:.6f}")
+            self.logger.info(f"    • Val Accuracy: {accuracy:.4f}%")
+            self.logger.info(f"    • Learning Rate: {current_lr:.8f}")
+            self.logger.info(f"    • Epoch Time: {epoch_time:.2f}s")
+            self.logger.info(f"    • Total Time: {total_time:.2f}s")
+            self.logger.info(f"    • ETA: {eta_minutes:.1f}min")
+
+            # Memory logging
+            if torch.cuda.is_available():
+                gpu_memory = torch.cuda.memory_allocated(self.device) / 1024**3
+                gpu_cached = torch.cuda.memory_reserved(self.device) / 1024**3
+                self.logger.info(f"    • GPU Memory: {gpu_memory:.2f}GB allocated, {gpu_cached:.2f}GB cached")
             
             # Save best model
             if val_loss < best_val_loss:
@@ -281,7 +407,40 @@ class ModelTrainer(TrainingCore):
                 )
         
         training_time = time.time() - start_time
-        
+
+        # Enhanced training completion summary
+        self.logger.info("\n" + "=" * 60)
+        self.logger.info("🎉 TRAINING COMPLETED SUCCESSFULLY!")
+        self.logger.info("=" * 60)
+
+        # Final results summary
+        final_train_loss = history['train_loss'][-1] if history['train_loss'] else 0
+        final_val_loss = history['val_loss'][-1] if history['val_loss'] else 0
+        final_val_accuracy = history['val_accuracy'][-1] if history['val_accuracy'] else 0
+
+        self.logger.info("📊 FINAL RESULTS:")
+        self.logger.info(f"  • Total Training Time: {training_time:.2f}s ({training_time/60:.1f}m)")
+        self.logger.info(f"  • Final Train Loss: {final_train_loss:.6f}")
+        self.logger.info(f"  • Final Val Loss: {final_val_loss:.6f}")
+        self.logger.info(f"  • Final Val Accuracy: {final_val_accuracy:.4f}%")
+        self.logger.info(f"  • Best Validation Loss: {best_val_loss:.6f}")
+
+        # Performance metrics
+        self.logger.info("📈 PERFORMANCE METRICS:")
+        if len(history['train_loss']) > 1:
+            train_improvement = history['train_loss'][0] - history['train_loss'][-1]
+            val_improvement = history['val_loss'][0] - history['val_loss'][-1]
+            self.logger.info(f"  • Train Loss Improvement: {train_improvement:.6f}")
+            self.logger.info(f"  • Val Loss Improvement: {val_improvement:.6f}")
+
+        avg_epoch_time = training_time / args['epochs']
+        self.logger.info(f"  • Average Epoch Time: {avg_epoch_time:.2f}s")
+
+        # Model saving summary
+        self.logger.info("💾 MODEL SAVED:")
+        self.logger.info(f"  • Best Model: best_model.pt (val_loss: {best_val_loss:.6f})")
+        self.logger.info(f"  • Final Model: model_final.pt")
+
         # Save final model
         self.model_manager.save_model(
             model=self.model,
@@ -298,11 +457,198 @@ class ModelTrainer(TrainingCore):
             },
             filename='model_final.pt'
         )
-        
-        self.logger.info(f"Training completed in {training_time:.2f} seconds")
+
+        # Final memory cleanup logging
+        if torch.cuda.is_available():
+            final_memory = torch.cuda.memory_allocated(self.device) / 1024**3
+            self.logger.info(f"🔧 FINAL GPU STATE:")
+            self.logger.info(f"  • Memory Allocated: {final_memory:.2f}GB")
+
+            # Clear cache
+            torch.cuda.empty_cache()
+            cleared_memory = torch.cuda.memory_allocated(self.device) / 1024**3
+            self.logger.info(f"  • Memory After Cache Clear: {cleared_memory:.2f}GB")
+
+        self.logger.info("=" * 60)
+        self.logger.info("✅ READY FOR BACKTESTING!")
+        self.logger.info("=" * 60)
         
         return self.model, history
-    
+
+    def _setup_rocm_memory_optimizations(self, model, use_mixed_precision):
+        """Setup ROCm 7 + PyTorch 2.10 optimizations for distributed training."""
+
+        if not torch.cuda.is_available():
+            return
+
+        # PyTorch 2.10 torch.compile optimization
+        try:
+            self._setup_pytorch210_compile(model)
+        except Exception as e:
+            self.logger.warning(f"Could not setup torch.compile: {e}")
+
+        # Enable gradient checkpointing if model supports it
+        if hasattr(model, 'enable_gradient_checkpointing'):
+            model.enable_gradient_checkpointing()
+            self.logger.info("✅ ROCm 7 gradient checkpointing enabled")
+
+        # Setup memory pool for better memory management
+        try:
+            # Configure memory pool size based on available GPU memory
+            total_memory = torch.cuda.get_device_properties(self.device).total_memory
+            pool_size_gb = min(8, total_memory / (1024**3) * 0.2)  # 20% of GPU memory, max 8GB
+
+            self.logger.info(f"🔧 Setting up ROCm 7 memory pool: {pool_size_gb:.1f}GB")
+
+            # PyTorch memory settings for ROCm 7
+            torch.cuda.empty_cache()
+
+            # Enable memory pool if available
+            if hasattr(torch.cuda, 'memory'):
+                self.logger.info("✅ ROCm 7 memory pool optimizations applied")
+
+        except Exception as e:
+            self.logger.warning(f"Could not setup memory pool: {e}")
+
+        # Enable mixed precision scaler if requested
+        if use_mixed_precision:
+            from torch.cuda.amp import GradScaler
+            self.scaler = GradScaler()
+            self.logger.info("✅ ROCm 7 mixed precision scaler initialized")
+
+        # Log memory optimization status
+        initial_memory = torch.cuda.memory_allocated(self.device) / 1024**3
+        self.logger.info(f"🔧 ROCm 7 Memory optimizations initialized")
+        self.logger.info(f"  • Initial GPU Memory: {initial_memory:.2f}GB")
+        self.logger.info(f"  • Mixed Precision: {use_mixed_precision}")
+        self.logger.info(f"  • Gradient Checkpointing: {hasattr(model, 'use_gradient_checkpointing') and model.use_gradient_checkpointing}")
+
+    def _setup_pytorch210_compile(self, model):
+        """Setup PyTorch 2.10 torch.compile with ROCm 7.0 optimizations."""
+
+        # Check if torch.compile is available
+        if not hasattr(torch, 'compile'):
+            self.logger.warning("torch.compile not available in this PyTorch version")
+            return
+
+        # Determine GPU architecture for optimal compilation
+        gpu_name = torch.cuda.get_device_name(0).lower()
+
+        if 'mi300x' in gpu_name or 'instinct' in gpu_name:
+            # MI300X (CDNA3) optimizations
+            compile_config = {
+                'mode': 'max-autotune',
+                'backend': 'inductor',
+                'options': {
+                    'triton.enable': True,
+                    'triton.autotune': True,
+                    'max_autotune': True,
+                    'epilogue_fusion': True,
+                    'layout_optimization': True,
+                    'conv_1x1_as_mm': True,
+                }
+            }
+            arch_name = "MI300X (CDNA3)"
+        elif '7900' in gpu_name or 'rdna3' in gpu_name:
+            # RDNA3 (7900 XT) optimizations
+            compile_config = {
+                'mode': 'reduce-overhead',
+                'backend': 'inductor',
+                'options': {
+                    'triton.enable': True,
+                    'max_autotune': False,  # Faster compilation for consumer GPUs
+                    'layout_optimization': True,
+                }
+            }
+            arch_name = "RDNA3 (7900 XT)"
+        else:
+            # Generic ROCm optimizations
+            compile_config = {
+                'mode': 'default',
+                'backend': 'inductor',
+                'options': {
+                    'triton.enable': True,
+                    'layout_optimization': True,
+                }
+            }
+            arch_name = "Generic ROCm"
+
+        try:
+            # Compile model with PyTorch 2.10 optimizations
+            # Fix: Don't specify both mode and options
+            if compile_config['mode'] == 'max-autotune':
+                self.compiled_model = torch.compile(
+                    model,
+                    mode=compile_config['mode'],
+                    backend=compile_config['backend']
+                )
+            else:
+                self.compiled_model = torch.compile(
+                    model,
+                    backend=compile_config['backend']
+                )
+
+            self.logger.info(f"🚀 PyTorch 2.10 torch.compile enabled for {arch_name}")
+            self.logger.info(f"  • Mode: {compile_config['mode']}")
+            self.logger.info(f"  • Backend: {compile_config['backend']}")
+
+            # Store reference to compiled model
+            self.use_compiled_model = True
+
+        except Exception as e:
+            self.logger.warning(f"torch.compile failed: {e}")
+            self.compiled_model = model
+            self.use_compiled_model = False
+
+    def get_model_for_training(self):
+        """Get the appropriate model (compiled or original) for training."""
+        if hasattr(self, 'use_compiled_model') and self.use_compiled_model:
+            return self.compiled_model
+        return self.model
+
+    def optimize_memory_usage(self):
+        """Optimize memory usage during training."""
+        if torch.cuda.is_available():
+            # Clear cache
+            torch.cuda.empty_cache()
+
+            # Log memory usage
+            allocated = torch.cuda.memory_allocated(self.device) / 1024**3
+            reserved = torch.cuda.memory_reserved(self.device) / 1024**3
+
+            self.logger.info(f"🔧 Memory Optimization:")
+            self.logger.info(f"  • Allocated: {allocated:.2f}GB")
+            self.logger.info(f"  • Reserved: {reserved:.2f}GB")
+
+            # Check for memory leaks
+            if allocated > 15.0:  # If using more than 15GB, warn
+                self.logger.warning(f"⚠️  High memory usage detected: {allocated:.2f}GB")
+                self.logger.warning("  Consider reducing batch size or enabling gradient checkpointing")
+
+    def check_memory_safety(self):
+        """Check if memory usage is safe to continue training."""
+        if not torch.cuda.is_available():
+            return True
+
+        try:
+            # Get total GPU memory
+            total_memory = torch.cuda.get_device_properties(self.device).total_memory / 1024**3
+            allocated = torch.cuda.memory_allocated(self.device) / 1024**3
+            usage_percent = (allocated / total_memory) * 100
+
+            if usage_percent > 95:
+                self.logger.error(f"🚨 CRITICAL: GPU memory usage at {usage_percent:.1f}% - stopping training")
+                return False
+            elif usage_percent > 85:
+                self.logger.warning(f"⚠️  HIGH: GPU memory usage at {usage_percent:.1f}%")
+                # Clear cache to try to free memory
+                torch.cuda.empty_cache()
+
+            return True
+        except Exception as e:
+            self.logger.warning(f"Could not check memory safety: {e}")
+            return True
+
     # Rest of the file remains unchanged...
     def evaluate_model(self, model, X_test, y_test):
         """

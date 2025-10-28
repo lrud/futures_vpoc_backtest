@@ -75,7 +75,14 @@ def parse_arguments():
         action="store_true",
         help="Enable verbose logging"
     )
-    
+
+    parser.add_argument(
+        "--data_fraction", "-df",
+        type=float,
+        default=1.0,
+        help="Fraction of data to use for backtesting (0.1-1.0)"
+    )
+
     return parser.parse_args()
 
 def find_latest_model(base_dir=settings.TRAINING_DIR):
@@ -106,10 +113,10 @@ def find_latest_model(base_dir=settings.TRAINING_DIR):
         logger.error(f"Error finding latest model: {e}")
         return None
 
-def load_historical_data(data_path, contract_filter=None):
+def load_historical_data(data_path, contract_filter=None, data_fraction=1.0):
     """Load historical data for backtesting."""
     import pandas as pd
-    
+
     try:
         # Check if data_path is a file or directory
         if os.path.isfile(data_path):
@@ -143,11 +150,30 @@ def load_historical_data(data_path, contract_filter=None):
             logger.error(f"Invalid data path: {data_path}")
             return None
             
-        # Sort by date
+        # Sort by date and set datetime index
         if 'date' in data.columns:
             data['date'] = pd.to_datetime(data['date'])
             data = data.sort_values('date')
-            
+            data = data.set_index('date')
+        elif 'datetime' in data.columns:
+            data['datetime'] = pd.to_datetime(data['datetime'])
+            data = data.sort_values('datetime')
+            data = data.set_index('datetime')
+        else:
+            logger.error("Data must have a 'date' or 'datetime' column for datetime index")
+            return None
+
+        # Apply data sampling if requested
+        if data_fraction < 1.0:
+            if not (0.01 <= data_fraction <= 1.0):
+                logger.error(f"Invalid data_fraction: {data_fraction}. Must be between 0.01 and 1.0")
+                return None
+
+            logger.info(f"Sampling {data_fraction*100:.1f}% of data")
+            sample_size = max(1, int(len(data) * data_fraction))
+            data = data.iloc[-sample_size:]  # Take most recent data
+            logger.info(f"Sampled {len(data)} rows ({data_fraction*100:.1f}% of original)")
+
         return data
         
     except Exception as e:
@@ -182,7 +208,8 @@ def main():
     # Load historical data
     data = load_historical_data(
         args.data_path,
-        contract_filter=None if args.contract == "ALL" else args.contract
+        contract_filter=None if args.contract == "ALL" else args.contract,
+        data_fraction=args.data_fraction
     )
     
     if data is None or data.empty:

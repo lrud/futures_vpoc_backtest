@@ -6,7 +6,7 @@ import os
 import sys
 import argparse
 import torch
-from datetime import datetime
+from datetime import datetime, timedelta
 
 # Import local modules
 from src.ml.model import AMDOptimizedFuturesModel
@@ -93,12 +93,27 @@ def parse_arguments():
     )
     
     parser.add_argument(
-        "--device_ids", 
+        "--device_ids",
         type=str,
         default="0,1",
         help="Comma-separated list of GPU device IDs to use"
     )
-    
+
+    parser.add_argument(
+        "--data_fraction", "-df",
+        type=float,
+        default=1.0,
+        help="Fraction of data to use for training (0.1 = 10%, 1.0 = 100%)"
+    )
+
+    parser.add_argument(
+        "--distributed_strategy",
+        type=str,
+        choices=['dataparallel', 'fsdp', 'auto'],
+        default='auto',
+        help="Distributed training strategy: dataparallel, fsdp, or auto (default)"
+    )
+
     return parser.parse_args()
 
 def create_model(input_dim: int, args: argparse.Namespace):
@@ -132,6 +147,72 @@ def create_model(input_dim: int, args: argparse.Namespace):
     
     return model
 
+def setup_pytorch210_fsdp(model, device_ids, use_mixed_precision=False):
+    """Setup PyTorch 2.10 FSDP (Fully Sharded Data Parallel) as alternative to DataParallel."""
+
+    try:
+        from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
+        from torch.distributed.fsdp import MixedPrecision, BackwardPrefetch
+        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+        import torch.distributed as dist
+
+        # Check if distributed is already initialized
+        if not dist.is_initialized():
+            # Initialize process group for single-node, multi-GPU
+            os.environ['MASTER_ADDR'] = 'localhost'
+            os.environ['MASTER_PORT'] = '12355'
+            os.environ['RANK'] = '0'
+            os.environ['WORLD_SIZE'] = str(len(device_ids))
+            os.environ['LOCAL_RANK'] = '0'
+
+            dist.init_process_group(
+                backend='hccl',  # ROCm backend
+                init_method='env://',
+                timeout=torch.distributed.Timeout(seconds=1800)
+            )
+
+        # Mixed precision configuration for PyTorch 2.10
+        mixed_precision_config = None
+        if use_mixed_precision:
+            mixed_precision_config = MixedPrecision(
+                param_dtype=torch.float16,
+                reduce_dtype=torch.float16,
+                buffer_dtype=torch.float16,
+            )
+
+        # Auto-wrap policy for layers
+        auto_wrap_policy = size_based_auto_wrap_policy(
+            min_num_params=10000,  # Wrap layers with >10k parameters
+        )
+
+        # FSDP configuration optimized for ROCm 7
+        fsdp_config = {
+            'mixed_precision': mixed_precision_config,
+            'auto_wrap_policy': auto_wrap_policy,
+            'backward_prefetch': BackwardPrefetch.BACKWARD_PRE,
+            'forward_prefetch': True,
+            'limit_all_gathers': True,
+            'use_orig_params': False,  # PyTorch 2.10 optimization
+            'cpu_init': False,  # Keep on GPU for better performance
+        }
+
+        # Create FSDP model
+        fsdp_model = FSDP(model, **fsdp_config)
+
+        logger.info("🚀 PyTorch 2.10 FSDP (Fully Sharded Data Parallel) enabled")
+        logger.info(f"  • Mixed Precision: {use_mixed_precision}")
+        logger.info(f"  • Device IDs: {device_ids}")
+        logger.info(f"  • Auto-wrap Policy: Enabled for layers >10k parameters")
+
+        return fsdp_model
+
+    except ImportError:
+        logger.warning("FSDP not available, falling back to DataParallel")
+        return None
+    except Exception as e:
+        logger.warning(f"FSDP setup failed: {e}, falling back to DataParallel")
+        return None
+
 def main():
     """Main execution function."""
     # Parse arguments
@@ -148,22 +229,61 @@ def main():
     # Verify and setup GPU environment
     use_gpu = torch.cuda.is_available()
     if use_gpu:
-        if not setup_rocm_environment():
+        # Force ROCm backend usage if available
+        try:
+            if torch.cuda.device_count() >= 2:
+                logger.info(f"Detected {torch.cuda.device_count()} GPUs - forcing distributed training")
+                use_distributed = True
+            else:
+                logger.info(f"Detected single GPU - using distributed training for ROCm optimization")
+                use_distributed = True
+
+            # Setup ROCm 7 specific environment variables for optimal performance
+            os.environ['HIP_VISIBLE_DEVICES'] = '0,1'
+            os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+            os.environ['ROCM_PATH'] = '/opt/rocm'
+            os.environ['HSA_ENABLE_SDMA'] = '0'
+            os.environ['HSA_ENABLE_INTERRUPT'] = '0'
+
+            # ROCm 7 specific memory settings
+            os.environ['PYTORCH_HIP_ALLOC_CONF'] = 'max_split_size_mb:512,garbage_collection_threshold:0.8'
+
+            # Enable flash attention and mixed precision optimizations
+            os.environ['TORCH_CUDNN_V8_API_ENABLED'] = '1'
+            os.environ['TORCH_ALLOW_TF32_CUBLAS_OVERRIDE'] = '0'
+            os.environ['HIP_FORCE_DEV_KERNARG'] = '1'
+
+        except Exception as e:
+            logger.error(f"Failed to initialize ROCm environment: {e}")
             logger.warning("Falling back to CPU training")
             use_gpu = False
-        else:
-            # Log detailed GPU information
-            for i in range(torch.cuda.device_count()):
-                logger.info(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-                logger.info(f"  Memory: {torch.cuda.get_device_properties(i).total_memory/1e9:.2f}GB")
-                logger.info(f"  Compute: {torch.cuda.get_device_properties(i).multi_processor_count} SMs")
+            use_distributed = False
     else:
         logger.warning("No GPU detected - falling back to CPU training")
     
     # Set device for training
     device = torch.device('cuda' if use_gpu else 'cpu')
-    device_ids = [int(id) for id in args.device_ids.split(',')] if args.device_ids else None
+
+    # Setup device IDs for distributed training
+    if args.no_distributed:
+        use_distributed = False
+        device_ids = [0] if use_gpu else None
+        logger.info("Forcing single-GPU training as requested")
+    else:
+        device_ids = [int(id) for id in args.device_ids.split(',')] if args.device_ids else list(range(torch.cuda.device_count())) if use_gpu else None
+
+    if use_gpu and device_ids:
+        # Ensure we have available GPUs
+        available_gpus = torch.cuda.device_count()
+        device_ids = [id for id in device_ids if id < available_gpus]
+        if not device_ids:
+            logger.error("No valid GPU IDs available")
+            use_gpu = False
+            device_ids = None
+
     logger.info(f"Using device: {device} with device IDs: {device_ids}")
+    if use_gpu and device_ids:
+        logger.info(f"Distributed training: {use_distributed} across {len(device_ids)} GPUs")
     
     # Create timestamp for this run
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -180,13 +300,20 @@ def main():
     # Log GPU memory before data loading
     if use_gpu:
         for i in range(torch.cuda.device_count()):
-            logger.info(f"Preprocessing - GPU {i} memory: {torch.cuda.memory_allocated(i)/1e9:.2f}GB used / {torch.cuda.get_device_properties(i).total_memory/1e9:.2f}GB total")
+            try:
+                total_memory = torch.cuda.get_device_properties(i).total_memory/1e9
+                allocated_memory = torch.cuda.memory_allocated(i)/1e9
+                logger.info(f"Preprocessing - GPU {i} memory: {allocated_memory:.2f}GB used / {total_memory:.2f}GB total")
+            except Exception as e:
+                logger.warning(f"Could not get GPU {i} properties: {e}")
+                logger.info(f"Preprocessing - GPU {i} available")
     
     # Load and distribute data
-    result = prepare_data(args, 
-                        contract_filter=None if args.contract == "ALL" else args.contract, 
-                        data_path=data_path, 
-                        device_ids=device_ids)
+    result = prepare_data(args,
+                        contract_filter=None if args.contract == "ALL" else args.contract,
+                        data_path=data_path,
+                        device_ids=device_ids,
+                        data_fraction=args.data_fraction)
     if not result:
         logger.error("Data preparation failed")
         return 1
@@ -196,7 +323,13 @@ def main():
     # Log GPU memory after data loading
     if use_gpu:
         for i in range(torch.cuda.device_count()):
-            logger.info(f"Post-processing - GPU {i} memory: {torch.cuda.memory_allocated(i)/1e9:.2f}GB used / {torch.cuda.get_device_properties(i).total_memory/1e9:.2f}GB total")
+            try:
+                total_memory = torch.cuda.get_device_properties(i).total_memory/1e9
+                allocated_memory = torch.cuda.memory_allocated(i)/1e9
+                logger.info(f"Post-processing - GPU {i} memory: {allocated_memory:.2f}GB used / {total_memory:.2f}GB total")
+            except Exception as e:
+                logger.warning(f"Could not get GPU {i} properties: {e}")
+                logger.info(f"Post-processing - GPU {i} available")
     
     # Create base model and move to device
     model = create_model(len(feature_columns), args)
@@ -205,95 +338,103 @@ def main():
     model = model.to(device)
     
     # Store feature column names and model metadata
-    model.feature_columns = feature_columns
-    model.input_dim = len(feature_columns)
-    model.hidden_layers = [int(dim) for dim in args.hidden_layers.split(',')]
-    model.dropout_rate = args.dropout_rate
+    if not hasattr(model, 'feature_columns'):
+        model.feature_columns = feature_columns
+    if not hasattr(model, 'input_dim'):
+        model.input_dim = len(feature_columns)
+    if not hasattr(model, 'hidden_layers_config'):
+        model.hidden_layers_config = [int(dim) for dim in args.hidden_layers.split(',')]
+    if not hasattr(model, 'dropout_rate_config'):
+        model.dropout_rate_config = args.dropout_rate
     
     # Initialize trainer with device
     trainer = ModelTrainer(model_dir=args.output_dir, device=device)
     
     # Enable Flash Attention if available
     if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
-        model.enable_flash_attention = True
-        logger.info("Flash Attention v3 enabled for model")
+        # Disable Flash Attention for ROCm 7 compatibility (kernel issues)
+        model.enable_flash_attention = False
+        logger.info("Flash Attention disabled for ROCm 7 compatibility")
     
-    # Determine if distributed training should be used
-    use_distributed = (not args.no_distributed and 
-                      use_gpu and 
-                      torch.cuda.device_count() > 1)
-    if use_distributed:
-        logger.info(f"Using distributed training with {torch.cuda.device_count()} GPUs")
-        # Import distributed only if needed
-        from src.ml.distributed_trainer import train_distributed
-        
-        # Set ROCm environment variables for optimal performance
-        os.environ['ROCM_HCCL_DEBUG'] = '2'
-        os.environ['HIP_VISIBLE_DEVICES'] = ','.join(map(str, range(torch.cuda.device_count())))
-        os.environ['HSA_ENABLE_SDMA'] = '0'
-        os.environ['GPU_MAX_HW_QUEUES'] = '8'
-        os.environ['PYTORCH_ROCM_WAVE32_MODE'] = '1'
-        os.environ['HSA_ENABLE_INTERRUPT'] = '0'
-        os.environ['HSA_ENABLE_WAIT_COMPLETION'] = '0'
-        os.environ['NCCL_NSOCKS_PERTHREAD'] = '8'
-        
-        # Verify and initialize PyTorch distributed backend
-        if not hasattr(torch, 'distributed') or not torch.distributed.is_available():
-            logger.warning("PyTorch distributed not available, falling back to single GPU")
-            use_distributed = False
-        else:
-            try:
-                torch.distributed.init_process_group(
-                    backend='rccl',
-                    init_method='env://',
-                    world_size=torch.cuda.device_count(),
-                    rank=0,
-                    timeout=datetime.timedelta(minutes=10)
-                )
-                
-                logger.info(f"Initialized ROCm distributed backend (rccl) with {torch.cuda.device_count()} GPUs")
-            except Exception as e:
-                logger.error(f"Failed to initialize distributed training: {e}")
-                use_distributed = False
-                # Fall back to single-GPU training
-                trained_model, history = trainer.train(
-                    model, X_train, y_train, X_val, y_val,
-                    args={
-                        'batch_size': args.batch_size,
-                        'epochs': args.epochs,
-                        'learning_rate': args.learning_rate,
-                        'use_mixed_precision': args.use_mixed_precision,
-                        'output_dir': args.output_dir,
-                        'device': device,
-                    }
-                )
-                return 0
-                
-            # Log detailed GPU information
-            for i in range(torch.cuda.device_count()):
-                props = torch.cuda.get_device_properties(i)
-                logger.info(f"GPU {i}: {props.name}")
-                logger.info(f"  Memory: {props.total_memory/1e9:.2f}GB")
-                logger.info(f"  Compute: {props.multi_processor_count} SMs")
-                logger.info(f"  ROCm Capability: {props.major}.{props.minor}")
-        
-            # Scale batch size for multi-GPU training
-            effective_batch_size = args.batch_size
-            logger.info(f"Using batch size of {effective_batch_size} per GPU (total {effective_batch_size * torch.cuda.device_count()} across {torch.cuda.device_count()} GPUs)")
-            
-            trained_model, history = train_distributed(
-                model, X_train, y_train, X_val, y_val,
-                args_dict={
-                    'batch_size': effective_batch_size,
-                    'epochs': args.epochs,
-                    'learning_rate': args.learning_rate,
-                    'use_mixed_precision': args.use_mixed_precision,
-                    'use_bfloat16': True,  # Force BF16 for ROCm
-                    'output_dir': args.output_dir,
-                    'device': device,
-                },
-                feature_columns=feature_columns
-            )
+    # Use distributed training for multi-GPU setup
+    use_multi_gpu = (not args.no_distributed and
+                     use_gpu and
+                     torch.cuda.device_count() > 1)
+
+    if use_multi_gpu:
+        device_ids = [0, 1]
+        logger.info(f"Multi-GPU training detected with {len(device_ids)} GPUs")
+
+        # ROCm 7 optimizations for multi-GPU
+        os.environ.update({
+            'PYTORCH_ROCM_ARCH': 'gfx1100',
+            'PYTORCH_ROCM_WAVE32_MODE': '1',
+            'PYTORCH_ROCM_FUSION': '1',
+            'PYTORCH_HIP_ALLOC_CONF': 'expandable_segments:True,max_split_size_mb:256',
+            'GPU_SINGLE_ALLOC_PERCENT': '90',
+            'HSA_ENABLE_SDMA': '0',
+            'HSA_ENABLE_INTERRUPT': '0',
+            'HSA_ENABLE_WAIT_COMPLETION': '0',
+            'GPU_MAX_HW_QUEUES': '8',
+            'ENABLE_FLASH_ATTENTION': '1',
+            'TORCH_COMPILE_BACKEND': 'inductor'
+        })
+
+        # Make both GPUs visible
+        os.environ['HIP_VISIBLE_DEVICES'] = '0,1'
+        os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+
+        # Choose distributed strategy based on argument
+        strategy = args.distributed_strategy
+        if strategy == 'auto':
+            # Auto-select: Try FSDP first, fall back to DataParallel
+            strategy = 'fsdp'
+
+        logger.info(f"🎯 Using distributed strategy: {strategy}")
+
+        if strategy == 'fsdp':
+            # Try PyTorch 2.10 FSDP first
+            fsdp_model = setup_pytorch210_fsdp(model, device_ids, args.use_mixed_precision)
+            if fsdp_model is not None:
+                model = fsdp_model
+                logger.info("✅ PyTorch 2.10 FSDP (Fully Sharded Data Parallel) enabled")
+            else:
+                # Fall back to DataParallel
+                strategy = 'dataparallel'
+                logger.info("⚠️ FSDP failed, falling back to DataParallel")
+
+        if strategy == 'dataparallel':
+            # Use traditional DataParallel
+            model = torch.nn.DataParallel(model, device_ids=device_ids, output_device=device_ids[0])
+
+            # Enable Flash Attention
+            if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+                model.module.enable_flash_attention = False
+                logger.info("Flash Attention disabled for ROCm 7 compatibility (DataParallel)")
+
+            logger.info(f"🚀 DataParallel model created with GPUs: {device_ids}")
+
+        # Log GPU information
+        for i in device_ids:
+            if i < torch.cuda.device_count():
+                try:
+                    props = torch.cuda.get_device_properties(i)
+                    logger.info(f"GPU {i}: {props.name} ({props.total_memory/1e9:.1f}GB)")
+                except Exception as e:
+                    logger.warning(f"Could not get GPU {i} properties: {e}")
+
+        # Train with DataParallel model
+        trained_model, history = trainer.train(
+            model, X_train, y_train, X_val, y_val,
+            args={
+                'batch_size': args.batch_size,
+                'epochs': args.epochs,
+                'learning_rate': args.learning_rate,
+                'use_mixed_precision': args.use_mixed_precision,
+                'output_dir': args.output_dir,
+                'device': device,
+            }
+        )
     else:
         # Single device training (GPU or CPU)
         trained_model, history = trainer.train(
@@ -314,11 +455,50 @@ def main():
     
     # Save the trained model
     model_path = os.path.join(args.output_dir, "model.pt")
-    torch.save(trained_model.state_dict(), model_path)
+
+    # For DataParallel models, save the underlying model
+    if hasattr(trained_model, 'module'):
+        # Get the underlying model from DataParallel wrapper
+        final_model = trained_model.module
+        logger.info("Extracted model from DataParallel wrapper")
+    else:
+        final_model = trained_model
+
+    # Save model state dict
+    torch.save(final_model.state_dict(), model_path)
     logger.info(f"Model saved to {model_path}")
+
+    # Log training completion with GPU information
+    if use_multi_gpu:
+        logger.info("✅ Multi-GPU DataParallel training completed successfully!")
+        logger.info(f"🎯 Used GPUs: {device_ids}")
+    else:
+        logger.info("✅ Single-GPU training completed successfully!")
     
     logger.info("Training completed successfully")
     return 0
 
 if __name__ == "__main__":
-    sys.exit(main())
+    try:
+        sys.exit(main())
+    except Exception as e:
+        # Cleanup on any exception
+        logger.error(f"Training failed with error: {e}")
+        logger.info("Performing emergency GPU cleanup...")
+
+        # Clear GPU memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
+        # Kill any remaining processes
+        import subprocess
+        subprocess.run(['pkill', '-f', 'train.py'], capture_output=True)
+
+        sys.exit(1)
+    finally:
+        # Always cleanup, even on success
+        logger.info("Training completed - performing final GPU cleanup...")
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()

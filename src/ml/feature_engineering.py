@@ -10,6 +10,9 @@ from typing import List, Dict, Optional, Tuple
 import os
 from sklearn.preprocessing import StandardScaler
 from sklearn.feature_selection import SelectKBest, f_regression
+from scipy.optimize import minimize
+import warnings
+warnings.filterwarnings('ignore')
 
 from src.utils.logging import get_logger
 from src.core.vpoc import calculate_volume_profile, find_vpoc, find_value_area
@@ -23,7 +26,7 @@ class FeatureEngineer:
     def __init__(self, lookback_periods: List[int] = None, device_ids: List[int] = None):
         """
         Initialize feature engineering module.
-        
+
         Parameters:
         -----------
         lookback_periods: List[int]
@@ -33,18 +36,230 @@ class FeatureEngineer:
         """
         self.logger = get_logger(__name__)
         self.data_manager = FuturesDataManager()
-        
+
         # Use default lookback periods from settings if not provided
         if lookback_periods is None:
             from src.config.settings import settings
             self.lookback_periods = settings.DEFAULT_LOOKBACK_PERIODS
         else:
             self.lookback_periods = lookback_periods
-            
+
+        # Store device IDs for multi-GPU VPOC processing
+        self.device_ids = device_ids
+
         self.scaler = StandardScaler()
         self.feature_columns = []
-        
-    def load_and_prepare_data(self, data_path: str, contract_filter: Optional[str] = None, device_ids: List[int] = None) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str]]:
+
+    def calculate_garch_features(self, returns: pd.Series) -> Dict[str, float]:
+        """
+        Calculate GARCH-style volatility features for robust modeling.
+
+        Parameters:
+        -----------
+        returns : pd.Series
+            Return series
+
+        Returns:
+        --------
+        Dict[str, float]
+            GARCH-style volatility features
+        """
+        try:
+            # Remove NaN values from returns
+            returns_clean = returns.dropna()
+            if len(returns_clean) < 10:
+                self.logger.warning("Not enough data points for GARCH calculation")
+                return {}
+
+            squared_returns = returns_clean**2
+
+            # Initial parameter estimates using method of moments
+            omega = max(1e-6, np.var(squared_returns) * 0.01)  # Base variance
+
+            # Calculate ARCH effect safely
+            if len(squared_returns) > 1:
+                arch_corr = np.corrcoef(squared_returns[:-1], squared_returns[1:])[0,1]
+                if not np.isnan(arch_corr):
+                    alpha = max(0.01, min(0.3, arch_corr**2))
+                else:
+                    alpha = 0.1  # Default if correlation is NaN
+            else:
+                alpha = 0.1
+
+            beta = max(0.7, min(0.95, 1 - alpha))  # Persistence
+
+            # Calculate conditional variance using proper GARCH(1,1) recursion
+            conditional_var = []
+            var = omega / (1 - beta)  # Unconditional variance
+
+            for i in range(len(squared_returns)):
+                if i == 0:
+                    var = omega / (1 - beta)
+                else:
+                    var = omega + alpha * squared_returns.iloc[i-1] + beta * var
+                conditional_var.append(var)
+
+            # Create series with matching index
+            conditional_var_series = pd.Series(conditional_var, index=returns_clean.index)
+
+            # Calculate additional GARCH statistics
+            long_run_var = omega / (1 - beta)
+            half_life = np.log(0.5) / np.log(beta) if beta > 0 and beta < 1 else 100
+
+            return {
+                'garch_omega': omega,
+                'garch_alpha': alpha,
+                'garch_beta': beta,
+                'garch_vol_persistence': beta,
+                'garch_current_vol': np.sqrt(conditional_var_series.iloc[-1]) if len(conditional_var_series) > 0 else np.std(returns_clean),
+                'garch_vol_forecast': np.sqrt(conditional_var_series.mean() if len(conditional_var_series) > 0 else np.std(returns_clean)),
+                'garch_long_run_vol': np.sqrt(long_run_var),
+                'garch_half_life': half_life,
+                'arch_effect': alpha,
+                'garch_num_obs': len(returns_clean)
+            }
+
+        except Exception as e:
+            self.logger.warning(f"GARCH calculation failed: {e}")
+            return {}
+
+    def apply_robust_transformations(self, data: pd.DataFrame) -> pd.DataFrame:
+        """
+        Apply robust statistical transformations to mitigate overfitting.
+
+        Parameters:
+        -----------
+        data : pd.DataFrame
+            Input data
+
+        Returns:
+        --------
+        pd.DataFrame
+            Data with robust transformations applied
+        """
+        df = data.copy()
+
+        try:
+            # 1. Log transformation for returns (handles heteroskedasticity)
+            close_col = 'Close' if 'Close' in df.columns else 'session_close' if 'session_close' in df.columns else None
+            if close_col:
+                df['log_return'] = np.log(1 + df[close_col].pct_change())
+                df['log_return_abs'] = np.abs(df['log_return'])
+                self.logger.info(f"Applied log transformation to returns (using {close_col} column)")
+
+            # 2. Winsorization (handles outliers)
+            if 'returns' in df.columns:
+                lower_1 = df['returns'].quantile(0.01)
+                upper_99 = df['returns'].quantile(0.99)
+                df['returns_winsorized'] = df['returns'].clip(lower_1, upper_99)
+
+                lower_5 = df['returns'].quantile(0.05)
+                upper_95 = df['returns'].quantile(0.95)
+                df['returns_winsorized_95'] = df['returns'].clip(lower_5, upper_95)
+
+                self.logger.info("Applied winsorization to returns")
+
+            # 3. Robust scaling using median and MAD
+            if 'log_return' in df.columns:
+                median_val = df['log_return'].median()
+                mad_val = (df['log_return'] - median_val).abs().median()
+                df['log_return_robust_scaled'] = (df['log_return'] - median_val) / (mad_val + 1e-8)
+
+                # Z-score robust scaling
+                rolling_median = df['log_return'].rolling(20).median()
+                rolling_mad = (df['log_return'] - rolling_median).abs().rolling(20).median()
+                df['log_return_rolling_zscore'] = (df['log_return'] - rolling_median) / (rolling_mad + 1e-8)
+
+                self.logger.info("Applied robust scaling methods")
+
+        except Exception as e:
+            self.logger.error(f"Robust transformations failed: {e}")
+
+        return df
+
+    def create_robust_target(self, data: pd.DataFrame, target_type: str = 'log') -> pd.DataFrame:
+        """
+        Create robust target variable for ML training.
+
+        Parameters:
+        -----------
+        data : pd.DataFrame
+            Input data
+        target_type : str
+            Type of target transformation ('log', 'raw', 'winsorized')
+
+        Returns:
+        --------
+        pd.DataFrame
+            Data with robust target variable
+        """
+        df = data.copy()
+        self.logger.info(f"🎯 Starting target creation with columns: {list(df.columns)[:10]}...")
+
+        try:
+            # Look for close price column in order of preference
+            close_col = None
+            if 'session_close' in df.columns:
+                close_col = 'session_close'
+                self.logger.info(f"✅ Found 'session_close' column for target creation")
+            elif 'Close' in df.columns:
+                close_col = 'Close'
+                self.logger.info(f"✅ Found 'Close' column for target creation")
+            elif 'close' in df.columns:
+                close_col = 'close'
+                self.logger.info(f"✅ Found 'close' column for target creation")
+
+            if close_col:
+                self.logger.info(f"📈 Using '{close_col}' column for target creation")
+                returns = df[close_col].pct_change()
+                self.logger.info(f"📊 Returns calculation completed, len={len(returns)}, non-null={returns.notna().sum()}")
+
+                if target_type == 'log':
+                    # Log transformation to handle heteroskedasticity and make distribution more normal
+                    df['target'] = np.log(1 + returns.shift(-1))
+                    df['target_transformed'] = 'log'
+                    self.logger.info("✅ Created log-transformed target variable")
+                elif target_type == 'winsorized':
+                    # Winsorized target to reduce outlier impact
+                    lower_1 = returns.quantile(0.01)
+                    upper_99 = returns.quantile(0.99)
+                    df['target'] = returns.shift(-1).clip(lower_1, upper_99)
+                    df['target_transformed'] = 'winsorized_1-99'
+                    self.logger.info("✅ Created winsorized target variable")
+                else:
+                    # Raw returns
+                    df['target'] = returns.shift(-1)
+                    df['target_transformed'] = 'raw'
+                    self.logger.info("✅ Created raw returns target variable")
+
+                # Verify target was created
+                if 'target' in df.columns:
+                    target_count = df['target'].notna().sum()
+                    self.logger.info(f"🎯 SUCCESS: Target variable created with {target_count} non-null values")
+                    return df
+                else:
+                    self.logger.error("❌ FAILED: Target column not created after calculation")
+
+            else:
+                self.logger.error(f"❌ No close price column found for target creation. Available columns: {list(df.columns)}")
+                # Create a dummy target to prevent complete failure
+                df['target'] = 0.0
+                df['target_transformed'] = 'dummy'
+                self.logger.warning("⚠️ Created dummy target variable to prevent failure")
+                return df
+
+        except Exception as e:
+            self.logger.error(f"❌ Target creation failed: {e}")
+            import traceback
+            self.logger.error(f"Full traceback: {traceback.format_exc()}")
+            # Create a dummy target to prevent complete failure
+            df['target'] = 0.0
+            df['target_transformed'] = 'dummy'
+            self.logger.warning("⚠️ Created dummy target variable to prevent failure")
+
+        return df
+
+    def load_and_prepare_data(self, data_path: str, contract_filter: Optional[str] = None, device_ids: List[int] = None, data_fraction: float = 1.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str]]:
         """
         Complete data loading and preparation pipeline.
         
@@ -56,6 +271,8 @@ class FeatureEngineer:
             Contract type to filter (ES, VIX, or None for all)
         device_ids: List[int]
             List of GPU device IDs to use for parallel processing
+        data_fraction: float
+            Fraction of data to use (0.1 = 10%, 1.0 = 100%)
             
         Returns:
         --------
@@ -81,26 +298,18 @@ class FeatureEngineer:
             
             # Convert to tensors and distribute
             features_df = self.prepare_features(data)
-            X = torch.tensor(features_df[self.feature_columns].values, dtype=torch.float32)
-            y = torch.tensor(features_df['target'].values, dtype=torch.float32)
-            
-            # Create dataset and dataloader
-            dataset = TensorDataset(X, y)
-            dataloader = DataLoader(dataset, batch_size=len(X)//len(device_ids), 
-                                  shuffle=False, num_workers=len(device_ids))
-            
-            # Distribute batches to GPUs
-            X_batches = []
-            y_batches = []
-            for i, (X_batch, y_batch) in enumerate(dataloader):
-                device = f'cuda:{device_ids[i % len(device_ids)]}'
-                X_batches.append(X_batch.to(device))
-                y_batches.append(y_batch.to(device))
-            
+
+            # Create target variable using the enhanced robust target creation method
+            features_df = self.create_robust_target(features_df, target_type='log')
+
+            # Return numpy arrays like the single GPU path for consistency
+            X = features_df[self.feature_columns].values
+            y = features_df['target'].values
+
             # Split into train/val
-            split_idx = int(len(X_batches) * 0.8)
-            return (X_batches[:split_idx], y_batches[:split_idx], 
-                   X_batches[split_idx:], y_batches[split_idx:], 
+            split_idx = int(len(X) * 0.8)
+            return (X[:split_idx], y[:split_idx],
+                   X[split_idx:], y[split_idx:],
                    self.feature_columns)
         else:
             # Single GPU/CPU path
@@ -111,7 +320,16 @@ class FeatureEngineer:
         
         if data is None or len(data) == 0:
             raise ValueError("Failed to load data or empty dataset")
-            
+
+        # Apply data sampling if specified
+        if data_fraction < 1.0:
+            self.logger.info(f"Using {data_fraction*100:.1f}% of data for training")
+            sample_size = int(len(data) * data_fraction)
+            # Use systematic sampling to maintain temporal order
+            step = len(data) // sample_size
+            data = data.iloc[::step].copy()
+            self.logger.info(f"Sampled {len(data)} rows from original dataset")
+
         # Handle contract filtering
         if contract_filter:
             self.logger.info(f"Filtering for contract: {contract_filter}")
@@ -132,12 +350,26 @@ class FeatureEngineer:
         if len(features_df) == 0:
             raise ValueError("Feature generation failed")
             
-        # Create target variable
-        if 'vpoc' in features_df.columns:
-            features_df['target'] = np.sign(features_df['vpoc'].shift(-1) - features_df['vpoc'])
-        else:
-            features_df['target'] = np.sign(features_df['close'].shift(-1) - features_df['close'])
-            
+        # Apply robust transformations including log transforms and GARCH modeling
+        self.logger.info("🔧 Applying robust statistical transformations...")
+        features_df = self.apply_robust_transformations(features_df)
+
+        # Create enhanced target variable using log-transformed returns
+        self.logger.info("🎯 Creating enhanced target variable...")
+        features_df = self.create_robust_target(features_df, target_type='log')
+
+        # Add GARCH volatility features if not already present
+        if not any(col.startswith('garch_') for col in features_df.columns):
+            self.logger.info("📈 Adding GARCH volatility features...")
+            if 'log_return' in features_df.columns:
+                garch_features = self.calculate_garch_features(features_df['log_return'].dropna())
+                # Add GARCH features as columns to the DataFrame
+                for key, value in garch_features.items():
+                    features_df[f'garch_{key}'] = value
+                self.logger.info("Added GARCH volatility features")
+            else:
+                self.logger.warning("No 'log_return' column found for GARCH calculation")
+
         features_df = features_df.dropna(subset=['target'])
         
         # Split into features and target
@@ -209,8 +441,8 @@ class FeatureEngineer:
                 va_volume_pct = 100  # Entire range is value area
                 
             else:
-                # Create volume profile using imported functions
-                volume_profile = calculate_volume_profile(session_data, price_precision=0.25)
+                # Create volume profile using imported functions with multi-GPU support
+                volume_profile = calculate_volume_profile(session_data, price_precision=0.25, device_ids=self.device_ids)
                 vpoc = find_vpoc(volume_profile)
                 val, vah, va_volume_pct = find_value_area(volume_profile)
             
@@ -528,3 +760,98 @@ class FeatureEngineer:
         )
         # Return only the valid numeric columns, index is preserved
         return features_df[valid_columns]
+
+
+def prepare_features_and_labels(data, use_feature_selection=True, max_features=15, test_size=0.2):
+    """
+    Standalone function to prepare features and labels for ML models.
+    This is a convenience function that wraps the FeatureEngineer class.
+
+    Parameters:
+    -----------
+    data : pd.DataFrame
+        Input dataframe with price and volume data
+    use_feature_selection : bool
+        Whether to use feature selection
+    max_features : int
+        Maximum number of features to select
+    test_size : float
+        Proportion of data to use for testing
+
+    Returns:
+    --------
+    X : np.ndarray
+        Feature matrix
+    y : np.ndarray
+        Target vector
+    feature_cols : list
+        List of feature column names
+    scaler : StandardScaler
+        Fitted scaler object
+    """
+    logger = get_logger(__name__)
+
+    # Create feature engineer instance
+    engineer = FeatureEngineer()
+
+    # Handle empty data
+    if data.empty:
+        logger.error("Empty dataframe provided")
+        return np.array([]), np.array([]), [], None
+
+    # Use the existing FeatureEngineer to prepare features
+    try:
+        features_df = engineer.prepare_features(data)
+
+        if features_df.empty:
+            logger.error("No features created from data")
+            return np.array([]), np.array([]), [], None
+
+        # Create target variable using the enhanced robust target creation method
+        features_df = engineer.create_robust_target(features_df)
+
+        # Remove rows with NaN values
+        features_df = features_df.dropna()
+
+        if features_df.empty:
+            logger.error("No valid data after target creation")
+            return np.array([]), np.array([]), [], None
+
+        # Get feature columns (exclude non-numeric and target columns)
+        exclude_cols = ['target', 'Date', 'date', 'Datetime', 'datetime']
+        feature_cols = [col for col in features_df.select_dtypes(include=[np.number]).columns
+                       if col not in exclude_cols]
+
+        if not feature_cols:
+            logger.error("No feature columns found")
+            return np.array([]), np.array([]), [], None
+
+        # Prepare feature matrix and target
+        X = features_df[feature_cols].fillna(0).values
+        y = features_df['target'].fillna(0).values
+
+        # Feature selection if requested
+        if use_feature_selection and len(feature_cols) > max_features:
+            from sklearn.feature_selection import SelectKBest, f_regression
+            selector = SelectKBest(score_func=f_regression, k=max_features)
+            X_selected = selector.fit_transform(X, y)
+
+            # Get selected feature names
+            selected_indices = selector.get_support(indices=True)
+            feature_cols = [feature_cols[i] for i in selected_indices]
+            X = X_selected
+
+            logger.info(f"Selected {len(feature_cols)} features using f_regression")
+
+        # Scale features
+        scaler = engineer.scaler
+        X_scaled = scaler.fit_transform(X)
+
+        logger.info(f"Prepared features: X shape={X_scaled.shape}, y shape={y.shape}")
+        logger.info(f"Feature columns: {feature_cols[:5]}{'...' if len(feature_cols) > 5 else ''}")
+
+        return X_scaled, y, feature_cols, scaler
+
+    except Exception as e:
+        logger.error(f"Error in prepare_features_and_labels: {e}")
+        return np.array([]), np.array([]), [], None

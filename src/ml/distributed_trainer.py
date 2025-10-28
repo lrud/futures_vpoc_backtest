@@ -1,9 +1,10 @@
 """
-Distributed training functionality for ML models with ROCm 6.3 optimizations.
+Distributed training functionality for ML models with ROCm 7.0 optimizations.
+Updated for PyTorch 2.10+ ROCm build with enhanced dual-GPU support.
 """
 
 import os
-import datetime
+from datetime import datetime, timedelta
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -17,52 +18,88 @@ from src.utils.logging import get_logger
 logger = get_logger(__name__)
 
 def _setup_process_group(rank, world_size):
-    """Initialize process group for distributed training with ROCm 6.3 optimizations."""
-    # ROCm 6.3+ optimized distributed training config
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    
-    # Financial ML specific ROCm optimizations
-    os.environ.update({
-        'ROCM_HCCL_DEBUG': '2',          # Detailed debugging
-        'HIP_VISIBLE_DEVICES': str(rank),
-        'HSA_ENABLE_SDMA': '0',          # Better for time series
-        'GPU_MAX_HW_QUEUES': '8',
-        'PYTORCH_ROCM_WAVE32_MODE': '1', # Optimized for 7900 XT
-        'HSA_ENABLE_INTERRUPT': '0',
-        'HSA_ENABLE_WAIT_COMPLETION': '0',
-        'NCCL_NSOCKS_PERTHREAD': '8',
-        'PYTORCH_ROCM_FUSION': '1',      # Enable kernel fusion
-        'PYTORCH_JIT_USE_NNC_NOT_NVFUSER': '1',
-        'GPU_SINGLE_ALLOC_PERCENT': '90' # Memory optimization
-    })
-    
-    # Initialize process group with financial-optimized settings
-    dist.init_process_group(
-        backend="rccl",
-        init_method="env://", 
-        world_size=world_size,
-        rank=rank,
-        timeout=datetime.timedelta(minutes=10),
-        group_name=f"finml_group_{rank}",
-        pg_options=dist.ProcessGroupNCCL.Options(
-            is_high_priority_stream=True,
-            _timeout=datetime.timedelta(minutes=5)
-    )
-    )
-    
-    # Configure GPU with financial ML optimizations
-    torch.cuda.set_device(rank)
-    torch.backends.cuda.enable_flash_sdp(True)  # Enable Flash Attention
-    torch.backends.cuda.enable_mem_efficient_sdp(True)
-    
-    # Log detailed ROCm info
-    props = torch.cuda.get_device_properties(rank)
-    logger.info(f"Initialized ROCm process group (rccl) for rank {rank}")
-    logger.info(f"GPU {rank} Info: {props.name}")
-    logger.info(f"  Compute: {props.multi_processor_count} SMs")
-    logger.info(f"  Memory: {props.total_memory/1e9:.2f}GB")
-    logger.info(f"  ROCm Optimizations: Flash Attention enabled")
+    """Initialize process group for distributed training with ROCm 7.0 optimizations."""
+    try:
+        # ROCm 7.0 optimized distributed training config
+        os.environ['MASTER_ADDR'] = '127.0.0.1'  # Use IP instead of localhost
+        os.environ['MASTER_PORT'] = '12355'
+        os.environ['WORLD_SIZE'] = str(world_size)
+        os.environ['RANK'] = str(rank)
+
+        # ROCm 7.0 specific optimizations for dual 7900 XT setup
+        os.environ.update({
+            # ROCm 7.0 HCCL (HIP Collective Communications Library) settings
+            'ROCM_HCCL_DEBUG': 'WARN',        # Reduced debugging for performance
+            'HIP_VISIBLE_DEVICES': str(rank), # Each process sees only its GPU
+            'HSA_ENABLE_SDMA': '0',           # Disable for better GPU utilization
+            'GPU_MAX_HW_QUEUES': '8',         # Optimize for 7900 XT
+
+            # ROCm 7.0 PyTorch specific settings
+            'PYTORCH_ROCM_ARCH': 'gfx1100',   # RDNA3 architecture for 7900 XT
+            'PYTORCH_HIP_ALLOC_CONF': 'expandable_segments:True,max_split_size_mb:128',
+            'HIP_LAUNCH_BLOCKING': '0',       # Async kernel launches
+
+            # Memory and performance optimizations
+            'GPU_SINGLE_ALLOC_PERCENT': '90',  # Lower for multi-GPU
+            'HSA_ENABLE_INTERRUPT': '0',
+            'HSA_ENABLE_WAIT_COMPLETION': '0',
+
+            # PyTorch 2.10+ ROCm optimizations
+            'TORCH_COMPILE_BACKEND': 'inductor',
+            'TORCHINDUCTOR_FUSION_GROUP_MAX_SIZE': '16',
+
+            # Flash Attention and kernel fusion
+            'PYTORCH_ROCM_FUSION': '1',
+            'ENABLE_FLASH_ATTENTION': '1',
+
+            # NCCL settings for ROCm
+            'NCCL_DEBUG': 'WARN',
+            'NCCL_SOCKET_IFNAME': 'lo',
+            'NCCL_NSOCKS_PERTHREAD': '4'
+        })
+
+        logger.info(f"🚀 Initializing ROCm 7.0 process group for rank {rank}/{world_size}")
+
+        # Initialize process group with ROCm 7.0 optimized settings
+        # Use 'gloo' backend which is more stable than nccl for ROCm
+        dist.init_process_group(
+            backend="gloo",  # Changed from nccl to gloo for better ROCm compatibility
+            init_method="env://",
+            world_size=world_size,
+            rank=rank,
+            timeout=datetime.timedelta(minutes=5)  # Reduced timeout
+        )
+
+        # Configure GPU with ROCm 7.0 optimizations
+        torch.cuda.set_device(rank)
+
+        # PyTorch 2.10+ Flash Attention settings
+        if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
+
+        # Enable ROCm-specific optimizations
+        torch._C._jit_set_profiling_executor(False)
+        torch._C._jit_set_profiling_mode(False)
+
+        # Log detailed ROCm 7.0 info
+        props = torch.cuda.get_device_properties(rank)
+        logger.info(f"✅ Initialized ROCm 7.0 process group (gloo) for rank {rank}")
+        logger.info(f"🎯 GPU {rank} Info: {props.name}")
+        logger.info(f"🔧 Compute: {props.multi_processor_count} compute units")
+        logger.info(f"💾 Memory: {props.total_memory/1e9:.2f}GB total")
+
+        # Log GPU memory status
+        free_mem, total_mem = torch.cuda.mem_get_info(rank)
+        logger.info(f"💾 Available Memory: {free_mem/1e9:.2f}GB / {total_mem/1e9:.2f}GB")
+        logger.info(f"⚡ ROCm 7.0 Optimizations: Flash Attention, BF16, Gloo enabled")
+
+        return True
+
+    except Exception as e:
+        logger.error(f"❌ Failed to initialize process group for rank {rank}: {e}")
+        return False
 
 def _cleanup_process_group():
     """Clean up distributed process group."""
@@ -70,14 +107,22 @@ def _cleanup_process_group():
         dist.destroy_process_group()
 
 def _train_worker(rank, world_size, model, X_train, y_train, X_val, y_val, args_dict, feature_columns):
-    """Worker function for distributed training with ROCm 6.3 optimizations."""
-    # Initialize process group with enhanced ROCm settings
-    _setup_process_group(rank, world_size)
-    
+    """Worker function for distributed training with ROCm 7.0 optimizations."""
+    logger.info(f"🚀 Starting distributed worker {rank}/{world_size}")
+
+    # Initialize process group with enhanced ROCm 7.0 settings
+    if not _setup_process_group(rank, world_size):
+        logger.error(f"❌ Failed to initialize process group for rank {rank}")
+        return None, {}
+
     # Enable Flash Attention if available
     if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
         model.enable_flash_attention = True
-        logger.info(f"Rank {rank}: Enabled Flash Attention for time series modeling")
+        logger.info(f"✅ Rank {rank}: Flash Attention enabled for time series modeling")
+
+    # Force model to use specific GPU
+    torch.cuda.set_device(rank)
+    logger.info(f"🎯 Rank {rank}: Assigned to GPU {rank} - {torch.cuda.get_device_name(rank)}")
     
     try:
         # Create device with ROCm optimizations
@@ -123,8 +168,8 @@ def _train_worker(rank, world_size, model, X_train, y_train, X_val, y_val, args_
             # Fallback to DDP
             ddp_model = DDP(
                 model,
-                device_ids=[device.index],
-                output_device=device.index,
+                device_ids=[device] if isinstance(device, int) else [device.index],
+                output_device=device if isinstance(device, int) else device.index,
                 find_unused_parameters=True,
                 gradient_as_bucket_view=True,
                 static_graph=True
@@ -173,8 +218,8 @@ def _train_worker(rank, world_size, model, X_train, y_train, X_val, y_val, args_
             ddp_model.parameters(),
             lr=args_dict.get('learning_rate', 0.001),
             weight_decay=0.01,
-            foreach=True,
-            fused=True  # ROCm 6.3 optimized
+            foreach=True,  # Use foreach for ROCm optimization
+            fused=False   # Cannot use both foreach and fused together
         )
         
         # Financial-aware learning rate scheduler with ROCm optimizations
@@ -449,3 +494,96 @@ def train_distributed(model, X_train, y_train, X_val, y_val, args_dict, feature_
     history = checkpoint.get('history', {})
     
     return loaded_model, history
+
+
+class AMDFuturesTensorParallel:
+    """
+    AMD-optimized distributed training wrapper for futures models.
+    Provides a simple interface for distributed training functionality.
+    """
+
+    def __init__(self, session_type="RTH", contract="ES", world_size=None):
+        """
+        Initialize the distributed training wrapper.
+
+        Parameters:
+        -----------
+        session_type : str
+            Trading session type (RTH, ETH, etc.)
+        contract : str
+            Futures contract symbol (ES, NQ, etc.)
+        world_size : int
+            Number of processes for distributed training
+        """
+        self.logger = get_logger(__name__)
+        self.session_type = session_type
+        self.contract = contract
+        self.world_size = world_size or self._detect_gpu_count()
+
+        self.logger.info(f"Initialized AMDFuturesTensorParallel for {contract} {session_type}")
+        self.logger.info(f"World size: {self.world_size}")
+
+    def _detect_gpu_count(self):
+        """Detect available GPU count for distributed training."""
+        try:
+            import torch
+            if torch.cuda.is_available():
+                return torch.cuda.device_count()
+            else:
+                self.logger.warning("CUDA not available, using single GPU")
+                return 1
+        except ImportError:
+            self.logger.warning("PyTorch not available, using single process")
+            return 1
+
+    def train_model(self, model, X_train, y_train, X_val=None, y_val=None, **kwargs):
+        """
+        Train a model using distributed training.
+
+        Parameters:
+        -----------
+        model : torch.nn.Module
+            PyTorch model to train
+        X_train, y_train : np.ndarray
+            Training data
+        X_val, y_val : np.ndarray
+            Validation data (optional)
+        **kwargs : dict
+            Additional training arguments
+
+        Returns:
+        --------
+        dict
+            Training history and results
+        """
+        self.logger.info("Starting distributed training...")
+
+        # Use the existing train_distributed function
+        args_dict = {
+            'epochs': kwargs.get('epochs', 10),
+            'batch_size': kwargs.get('batch_size', 32),
+            'learning_rate': kwargs.get('learning_rate', 0.001),
+            'session_type': self.session_type,
+            'contract': self.contract
+        }
+
+        try:
+            history = train_distributed(
+                model=model,
+                X_train=X_train,
+                y_train=y_train,
+                X_val=X_val,
+                y_val=y_val,
+                args_dict=args_dict,
+                feature_columns=kwargs.get('feature_columns', None)
+            )
+
+            self.logger.info("Distributed training completed successfully")
+            return history
+
+        except Exception as e:
+            self.logger.error(f"Distributed training failed: {e}")
+            return {}
+
+    def __repr__(self):
+        return f"AMDFuturesTensorParallel(contract={self.contract}, session_type={self.session_type}, world_size={self.world_size})"

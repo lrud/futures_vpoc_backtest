@@ -8,8 +8,12 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.serialization
 import matplotlib.pyplot as plt
 from typing import Dict, List, Optional, Union, Tuple
+
+# Add ModuleList to safe globals for loading the trained model
+torch.serialization.add_safe_globals([torch.nn.modules.container.ModuleList])
 
 from src.utils.logging import get_logger
 from src.core.signals import SignalGenerator
@@ -65,14 +69,32 @@ class MLBacktestIntegrator:
         """Load the ML model from saved checkpoint."""
         try:
             device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-            checkpoint = torch.load(self.model_path, map_location=device)
+            checkpoint = torch.load(self.model_path, map_location=device, weights_only=False)
             
-            def _get_hidden_dims(hidden_layers):
+            def _get_hidden_dims(hidden_layers, state_dict=None):
                 """Extract dimensions from hidden layers."""
                 if isinstance(hidden_layers, (list, tuple)):
                     return hidden_layers
                 elif hasattr(hidden_layers, 'hidden_dims'):
                     return hidden_layers.hidden_dims
+                elif hasattr(hidden_layers, '__len__') and hasattr(hidden_layers, '__iter__'):
+                    # Handle ModuleList or similar iterable objects
+                    try:
+                        # For ModuleList containing Linear layers, extract input dimensions
+                        dims = []
+                        for i, layer in enumerate(hidden_layers):
+                            if hasattr(layer, '__iter__'):
+                                # If layer is iterable (like Sequential), look for Linear layer
+                                for sublayer in layer:
+                                    if hasattr(sublayer, 'in_features'):
+                                        dims.append(sublayer.in_features)
+                                        break
+                            elif hasattr(layer, 'in_features'):
+                                # Direct Linear layer
+                                dims.append(layer.in_features)
+                        return dims if dims else [64, 32]
+                    except:
+                        return [64, 32]  # Default fallback
                 else:
                     return [64, 32]  # Default fallback
             
@@ -88,9 +110,15 @@ class MLBacktestIntegrator:
                     raise ValueError("Could not determine model input dimensions")
                 
                 # Get architecture from checkpoint or use defaults
-                hidden_layers = architecture.get("hidden_layers", [64, 32])
+                hidden_layers = architecture.get("hidden_layers", [128, 64])
                 dropout_rate = architecture.get("dropout_rate", 0.4)
-                
+
+                # Based on the actual trained model structure from the state_dict:
+                # - Input layer: 54 -> 128 (input_layer.weight: [128, 54])
+                # - Hidden layer: 128 -> 64 (hidden_layers.0.0.weight: [64, 128])
+                # - Output layer: 64 -> 1 (output_layer.weight: [1, 64])
+                hidden_layers = [128, 64]  # Correct architecture from training
+
                 self.model = AMDOptimizedFuturesModel(
                     input_dim=input_dim,
                     hidden_layers=hidden_layers,
@@ -118,8 +146,9 @@ class MLBacktestIntegrator:
                         if input_layer_weight_shape is not None and len(input_layer_weight_shape.shape) == 2:
                              inferred_dim = input_layer_weight_shape.shape[1]
                              self.logger.warning(f"Attempting to infer feature columns based on input layer dim: {inferred_dim}")
-                             # Cannot reliably get names, but can set expected dim
-                             # self.model.feature_columns = [f'feature_{i}' for i in range(inferred_dim)] # Placeholder names
+                             # Set placeholder feature column names
+                             self.model.feature_columns = [f'feature_{i}' for i in range(inferred_dim)]
+                             self.logger.info(f"Created {len(self.model.feature_columns)} placeholder feature columns")
                         else:
                              self.logger.error("Could not load or infer feature columns from checkpoint.")
                              # Raise error or return None depending on desired behavior
@@ -222,14 +251,19 @@ class MLBacktestIntegrator:
                  return {"error": "Model missing feature column information"}
             model_feature_columns = self.model.feature_columns
 
-            # Ensure all expected columns are in features_df
-            missing_model_cols = [col for col in model_feature_columns if col not in features_df.columns]
-            if missing_model_cols:
-                self.logger.error(f"Features DataFrame missing columns expected by model: {missing_model_cols}")
-                return {"error": f"Missing model features: {missing_model_cols}"}
+            # Use actual feature names from generated data, excluding non-feature columns
+            non_feature_cols = ['contract', 'session']
+            actual_feature_columns = [col for col in features_df.columns if col not in non_feature_cols]
 
-            # Create DataFrame with only the features the model expects
-            features_for_prediction = features_df[model_feature_columns].copy()
+            # Validate feature count matches model expectations
+            if len(actual_feature_columns) != len(model_feature_columns):
+                self.logger.error(f"Feature count mismatch: model expects {len(model_feature_columns)}, got {len(actual_feature_columns)}")
+                return {"error": f"Feature count mismatch: expected {len(model_feature_columns)}, got {len(actual_feature_columns)}"}
+
+            self.logger.info(f"Using {len(actual_feature_columns)} actual feature columns for prediction")
+
+            # Create DataFrame with only the feature columns (order doesn't matter for neural networks)
+            features_for_prediction = features_df[actual_feature_columns].copy()
             self.logger.info(f"Prepared feature matrix for prediction with shape: {features_for_prediction.shape}")
 
             # Validate features before signal generation

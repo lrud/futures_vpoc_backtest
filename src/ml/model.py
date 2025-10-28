@@ -10,6 +10,7 @@ import os
 import numpy as np
 from typing import Dict, List, Optional, Union, Tuple
 import json
+from torch.utils.checkpoint import checkpoint
 
 from ..utils.logging import get_logger
 
@@ -36,6 +37,7 @@ class AMDOptimizedFuturesModel(nn.Module):
         self.dropout_rate = dropout_rate
         self.feature_columns = []
         self.enable_flash_attention = False
+        self.use_gradient_checkpointing = False  # Disabled due to memory constraints
 
         # ROCm 6.3 optimizations for financial models:
         # - Align dimensions for optimal memory access
@@ -90,10 +92,14 @@ class AMDOptimizedFuturesModel(nn.Module):
         self.final_norm = nn.LayerNorm(self.aligned_hidden_layers[-1])
 
     def forward(self, x):
-        # ROCm 6.3 memory alignment and mixed precision
+        # ROCm 7 memory alignment and mixed precision
         with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
             if hasattr(x, 'data_ptr') and x.data_ptr() % 128 != 0:
                 x = x.contiguous()
+
+            # ROCm 7 Gradient Checkpointing for memory optimization
+            if self.use_gradient_checkpointing and self.training:
+                return self._forward_with_checkpointing(x)
 
             # Flash Attention v3 implementation
             if self.enable_flash_attention:
@@ -135,7 +141,41 @@ class AMDOptimizedFuturesModel(nn.Module):
                             x = layer(x)
                         x = self.final_norm(x)
                         return self.output_layer(x)
-    
+
+    def _forward_with_checkpointing(self, x):
+        """Forward pass with ROCm 7 gradient checkpointing for memory optimization."""
+
+        def create_custom_forward(module):
+            def custom_forward(*inputs):
+                return module(inputs[0])
+            return custom_forward
+
+        # Apply gradient checkpointing to each layer for memory savings
+        x = checkpoint(create_custom_forward(self.input_layer), x)
+
+        # Checkpoint through hidden layers
+        for i, layer in enumerate(self.hidden_layers):
+            if i % 2 == 0:  # Checkpoint every other layer to balance speed/memory
+                x = checkpoint(create_custom_forward(layer), x)
+            else:
+                x = layer(x)
+
+        # Final layers
+        x = checkpoint(create_custom_forward(self.final_norm), x)
+        x = self.output_layer(x)
+
+        return x
+
+    def enable_gradient_checkpointing(self):
+        """Enable ROCm 7 gradient checkpointing for memory optimization."""
+        self.use_gradient_checkpointing = True
+        self.logger.info("ROCm 7 gradient checkpointing enabled for memory optimization")
+
+    def disable_gradient_checkpointing(self):
+        """Disable gradient checkpointing."""
+        self.use_gradient_checkpointing = False
+        self.logger.info("Gradient checkpointing disabled")
+
     def get_rocm_info(self):
         """Return ROCm specific optimization information based on documentation."""
         return {

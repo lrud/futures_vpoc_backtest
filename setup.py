@@ -25,7 +25,7 @@ setup(
     name="futures-vpoc-backtest",
     version="1.0.0",
     author="Lukas Rueda",
-    author_email="your.email@example.com",  # Update with actual email
+    author_email="lrud1314@pm.me",
     description="Advanced algorithmic trading strategy for E-mini S&P 500 futures with VPOC analysis and ML enhancement",
     long_description=long_description,
     long_description_content_type="text/markdown",

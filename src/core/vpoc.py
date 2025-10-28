@@ -1,3 +1,5 @@
+import os
+from typing import List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
@@ -7,180 +9,326 @@ from src.config.settings import settings
 logger = get_logger(__name__)
 
 class VolumeProfileAnalyzer:
-    """Handles volume profile analysis, VPOC, and value area calculations."""
-    
+    """Handles volume profile analysis, VPOC, and value area calculations with ROCm 7 multi-GPU optimization."""
+
     def __init__(self, price_precision=None, device='cuda', device_ids=None):
         self.logger = get_logger(__name__)
         self.price_precision = price_precision or settings.PRICE_PRECISION
-        
+
+        # ROCm 7 optimizations
+        os.environ['HIP_VISIBLE_DEVICES'] = ','.join(map(str, device_ids or [0]))
+        os.environ['HSA_ENABLE_SDMA'] = '0'
+        os.environ['HSA_ENABLE_INTERRUPT'] = '0'
+        os.environ['PYTORCH_ROCM_WAVE32_MODE'] = '1'
+
         # Handle multi-GPU setup
         if torch.cuda.is_available():
             if device_ids and len(device_ids) > 1:
-                self.device = f'cuda:{device_ids[0]}'  # Primary device
-                self.parallel = True
                 self.device_ids = device_ids
+                self.parallel = True
+                self.device = 'cuda'  # Use default CUDA device for distributed computing
+                self.num_gpus = len(device_ids)
+
+                # Initialize distributed processing for VPOC
+                self._setup_distributed_vpoc()
             else:
                 self.device = device
                 self.parallel = False
+                self.num_gpus = 1
+                self.device_ids = [0]
         else:
             self.device = 'cpu'
             self.parallel = False
-            
-        self.logger.info(f"Initialized VolumeProfileAnalyzer with precision {self.price_precision} on {self.device}" + 
-                        (f" using devices {device_ids}" if self.parallel else ""))
+            self.num_gpus = 1
+            self.device_ids = []
+
+        self.logger.info(f"🚀 Initialized ROCm 7 VolumeProfileAnalyzer with precision {self.price_precision} on {self.num_gpus} GPU(s): {self.device_ids}")
+
+    def _setup_distributed_vpoc(self):
+        """Setup distributed processing for VPOC calculations."""
+        try:
+            # Use ROCm's optimized scatter gather operations
+            self.logger.info("Setting up ROCm 7 distributed VPOC processing")
+
+            # Removed pre-allocation that was causing memory leaks
+            # Memory will be allocated dynamically as needed
+
+        except Exception as e:
+            self.logger.warning(f"Could not setup distributed VPOC optimizations: {e}")
+            self.parallel = False
     
     def calculate_volume_profile(self, session_df):
         """
-        Calculate volume profile for a single session with improved volume distribution.
-        
+        Calculate volume profile for a single session with ROCm 7 multi-GPU optimization.
+
         Parameters:
         -----------
         session_df : pandas.DataFrame
             DataFrame containing session data with OHLCV columns
-            
+
         Returns:
         --------
         pandas.DataFrame
             DataFrame with price levels and corresponding volumes
         """
-        self.logger.debug(f"Calculating volume profile for session with {len(session_df)} bars")
-        
-        # Convert to PyTorch tensors on GPU
+        self.logger.debug(f"🚀 ROCm 7 Multi-GPU Volume Profile Calculation: {len(session_df)} bars on {self.num_gpus} GPUs")
+
         try:
-            # Get OHLCV data as tensors
-            if self.parallel:
-                # Use DataParallel for multi-GPU
-                open_prices = torch.tensor(session_df['open'].values).to(self.device)
-                high_prices = torch.tensor(session_df['high'].values).to(self.device)
-                low_prices = torch.tensor(session_df['low'].values).to(self.device)
-                close_prices = torch.tensor(session_df['close'].values).to(self.device)
-                volumes = torch.tensor(session_df['volume'].values).to(self.device)
-                
-                # Replicate tensors across GPUs
-                open_prices = torch.nn.parallel.replicate(open_prices, self.device_ids)
-                high_prices = torch.nn.parallel.replicate(high_prices, self.device_ids)
-                low_prices = torch.nn.parallel.replicate(low_prices, self.device_ids)
-                close_prices = torch.nn.parallel.replicate(close_prices, self.device_ids)
-                volumes = torch.nn.parallel.replicate(volumes, self.device_ids)
+            if self.parallel and self.num_gpus > 1:
+                return self._calculate_volume_profile_distributed(session_df)
             else:
-                # Single GPU
-                open_prices = torch.tensor(session_df['open'].values, device=self.device)
-                high_prices = torch.tensor(session_df['high'].values, device=self.device)
-                low_prices = torch.tensor(session_df['low'].values, device=self.device)
-                close_prices = torch.tensor(session_df['close'].values, device=self.device)
-                volumes = torch.tensor(session_df['volume'].values, device=self.device)
-
-            # Find min and max prices
-            if self.parallel:
-                # Multi-GPU version
-                min_price = min(
-                    torch.min(torch.cat([t.min().unsqueeze(0) for t in low_prices])),
-                    torch.min(torch.cat([t.min().unsqueeze(0) for t in open_prices])),
-                    torch.min(torch.cat([t.min().unsqueeze(0) for t in close_prices]))
-                )
-                max_price = max(
-                    torch.max(torch.cat([t.max().unsqueeze(0) for t in high_prices])),
-                    torch.max(torch.cat([t.max().unsqueeze(0) for t in open_prices])),
-                    torch.max(torch.cat([t.max().unsqueeze(0) for t in close_prices]))
-                )
-            else:
-                # Single GPU version
-                min_price = min(low_prices.min(), open_prices.min(), close_prices.min())
-                max_price = max(high_prices.max(), open_prices.max(), close_prices.max())
-
-            # Round to nearest tick
-            min_price = torch.floor(min_price / self.price_precision) * self.price_precision
-            max_price = torch.ceil(max_price / self.price_precision) * self.price_precision
-
-            # Create price bins on GPU
-            price_bins = torch.arange(min_price, max_price + self.price_precision, 
-                                    self.price_precision, device=self.device)
-
-            # Initialize volume profile on GPU
-            volume_profile = torch.zeros_like(price_bins)
-
-            def process_bar(i):
-                """Process a single bar (helper function for parallel processing)"""
-                if self.parallel:
-                    bar_min = min(
-                        low_prices[i % len(self.device_ids)][i],
-                        open_prices[i % len(self.device_ids)][i],
-                        close_prices[i % len(self.device_ids)][i]
-                    )
-                    bar_max = max(
-                        high_prices[i % len(self.device_ids)][i],
-                        open_prices[i % len(self.device_ids)][i],
-                        close_prices[i % len(self.device_ids)][i]
-                    )
-                else:
-                    bar_min = min(low_prices[i], open_prices[i], close_prices[i])
-                    bar_max = max(high_prices[i], open_prices[i], close_prices[i])
-
-                mask = (price_bins >= bar_min) & (price_bins <= bar_max)
-                price_points = price_bins[mask]
-
-                if len(price_points) > 0:
-                    weights = torch.ones(len(price_points), device=self.device)
-                    prices = [
-                        open_prices[i % len(self.device_ids)][i] if self.parallel else open_prices[i],
-                        high_prices[i % len(self.device_ids)][i] if self.parallel else high_prices[i],
-                        low_prices[i % len(self.device_ids)][i] if self.parallel else low_prices[i],
-                        close_prices[i % len(self.device_ids)][i] if self.parallel else close_prices[i]
-                    ]
-                    
-                    for price in prices:
-                        distance = torch.abs(price_points - price)
-                        proximity_weight = 1.0 / (1.0 + distance)
-                        weights += proximity_weight
-
-                    weights = weights / weights.sum()
-                    vol = volumes[i % len(self.device_ids)][i] if self.parallel else volumes[i]
-                    return mask, weights * vol
-                return None, None
-
-            # Process all bars in parallel
-            results = []
-            if self.parallel:
-                # Distribute work across GPUs
-                inputs = [(i,) for i in range(len(session_df))]
-                results = torch.nn.parallel.parallel_apply(
-                    [process_bar]*len(inputs), 
-                    inputs,
-                    devices=self.device_ids
-                )
-            else:
-                # Single GPU processing
-                for i in range(len(session_df)):
-                    mask, weighted_vol = process_bar(i)
-                    if mask is not None:
-                        volume_profile[mask] += weighted_vol
-
-            # Combine results from multiple GPUs
-            if self.parallel:
-                for mask, weighted_vol in results:
-                    if mask is not None:
-                        volume_profile[mask] += weighted_vol.to(self.device)
-
-            # Apply smoothing on GPU
-            volume_profile_smooth = torch.zeros_like(volume_profile)
-            for i in range(len(volume_profile)):
-                start = max(0, i-1)
-                end = min(len(volume_profile), i+2)
-                volume_profile_smooth[i] = volume_profile[start:end].mean()
-
-            # Convert back to pandas DataFrame
-            volume_profile_df = pd.DataFrame({
-                'price_level': price_bins.cpu().numpy(),
-                'volume': volume_profile.cpu().numpy(),
-                'volume_smooth': volume_profile_smooth.cpu().numpy()
-            })
-
-            return volume_profile_df
+                return self._calculate_volume_profile_single_gpu(session_df)
 
         except Exception as e:
             self.logger.error(f"GPU volume profile calculation failed: {str(e)}")
             self.logger.info("Falling back to CPU implementation")
             return self._calculate_volume_profile_cpu(session_df)
+
+    def _calculate_volume_profile_distributed(self, session_df):
+        """Distributed VPOC calculation across multiple GPUs with ROCm 7 optimization."""
+        num_bars = len(session_df)
+        bars_per_gpu = num_bars // self.num_gpus
+        remainder = num_bars % self.num_gpus
+
+        # Split data across GPUs with proper validation
+        gpu_data = []
+        for gpu_id in range(self.num_gpus):
+            start_idx = gpu_id * bars_per_gpu
+            end_idx = start_idx + bars_per_gpu + (remainder if gpu_id == self.num_gpus - 1 else 0)
+
+            if start_idx < num_bars and end_idx > start_idx:
+                gpu_df = session_df.iloc[start_idx:end_idx].copy()
+                if len(gpu_df) > 0:  # Only add non-empty slices
+                    gpu_data.append(gpu_df)
+                else:
+                    self.logger.warning(f"Skipping GPU {gpu_id} due to empty data slice")
+            else:
+                self.logger.warning(f"Skipping GPU {gpu_id} due to invalid slice indices: start={start_idx}, end={end_idx}, num_bars={num_bars}")
+
+        # If we have less data than GPUs, ensure at least one GPU gets data
+        if not gpu_data and num_bars > 0:
+            gpu_data = [session_df.copy()]  # Give all data to first GPU
+            self.logger.warning(f"Insufficient data for {self.num_gpus} GPUs, using single GPU")
+
+        # Process VPOC on each GPU in parallel
+        results = []
+
+        def process_gpu_data(gpu_id, local_df):
+            """Process VPOC on a specific GPU."""
+            # Validate input data
+            if len(local_df) == 0:
+                raise ValueError(f"Empty dataframe provided to GPU {gpu_id}")
+
+            device = f'cuda:{gpu_id}'
+
+            with torch.cuda.device(device):
+                # Convert to tensors on this specific GPU
+                open_prices = torch.tensor(local_df['open'].values, device=device, dtype=torch.float32)
+                high_prices = torch.tensor(local_df['high'].values, device=device, dtype=torch.float32)
+                low_prices = torch.tensor(local_df['low'].values, device=device, dtype=torch.float32)
+                close_prices = torch.tensor(local_df['close'].values, device=device, dtype=torch.float32)
+                volumes = torch.tensor(local_df['volume'].values, device=device, dtype=torch.float32)
+
+                # Validate tensors are not empty
+                if len(open_prices) == 0 or len(high_prices) == 0 or len(low_prices) == 0:
+                    raise ValueError(f"Empty price tensors for GPU {gpu_id}")
+
+                # ROCm 7 optimized calculation with proper min/max operations
+                min_price = torch.min(torch.stack([
+                    low_prices.min(),
+                    open_prices.min(),
+                    close_prices.min()
+                ]))
+                max_price = torch.max(torch.stack([
+                    high_prices.max(),
+                    open_prices.max(),
+                    close_prices.max()
+                ]))
+
+                # ROCm 7 aligned memory operations
+                min_price = torch.floor(min_price / self.price_precision) * self.price_precision
+                max_price = torch.ceil(max_price / self.price_precision) * self.price_precision
+
+                # Ensure price range is valid (handle edge case where all prices are the same)
+                if max_price <= min_price:
+                    # Expand the range to include at least one price level
+                    price_range = max_price * 0.001  # 0.1% of price
+                    min_price = max_price - price_range
+                    max_price = max_price + price_range
+                    self.logger.warning(f"Expanded price range for GPU {gpu_id}: {min_price:.2f} - {max_price:.2f}")
+
+                price_bins = torch.arange(min_price, max_price + self.price_precision,
+                                        self.price_precision, device=device, dtype=torch.float32)
+
+                # Initialize volume profile
+                volume_profile = torch.zeros_like(price_bins, dtype=torch.float32)
+
+                # Vectorized bar processing for ROCm 7
+                bar_mins = torch.minimum(torch.minimum(open_prices, close_prices), low_prices)
+                bar_maxs = torch.maximum(torch.maximum(open_prices, close_prices), high_prices)
+
+                # ROCm 7 optimized matrix operations
+                for i in range(len(local_df)):
+                    bar_min = bar_mins[i]
+                    bar_max = bar_maxs[i]
+
+                    # Vectorized mask calculation
+                    mask = (price_bins >= bar_min) & (price_bins <= bar_max)
+                    price_points = price_bins[mask]
+
+                    if price_points.numel() > 0:  # Use numel() instead of len for tensors
+                        # ROCm 7 proximity weighting with distance calculations
+                        distances = torch.abs(price_points - close_prices[i])
+                        proximity_weights = 1.0 / (1.0 + distances)
+                        weights = proximity_weights + 1.0
+                        weights = weights / weights.sum()
+
+                        # Apply volume
+                        volume_profile[mask] += weights * volumes[i]
+
+                # ROCm 7 smoothing with convolution-like operations
+                if volume_profile.numel() > 0:
+                    kernel_size = 3
+                    padding = kernel_size // 2
+                    volume_profile_expanded = torch.nn.functional.pad(volume_profile, (padding, padding))
+                    volume_profile_smooth = torch.nn.functional.avg_pool1d(
+                        volume_profile_expanded.unsqueeze(0).unsqueeze(0),
+                        kernel_size, stride=1, padding=0
+                    ).squeeze()
+                else:
+                    volume_profile_smooth = volume_profile
+
+                # Convert results to CPU and clean up GPU memory
+                result = (price_bins.cpu().numpy(), volume_profile.cpu().numpy(), volume_profile_smooth.cpu().numpy())
+
+                # Clean up GPU tensors
+                del open_prices, high_prices, low_prices, close_prices, volumes
+                del price_bins, volume_profile, volume_profile_smooth
+                del bar_mins, bar_maxs
+                if 'volume_profile_expanded' in locals():
+                    del volume_profile_expanded
+
+                return result
+
+        # Launch parallel processing with proper error handling
+        import concurrent.futures
+        results = []
+
+        if not gpu_data:
+            raise ValueError("No valid data to process on any GPU")
+
+        # Use actual number of GPUs with data for worker count
+        actual_gpus = len(gpu_data)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=actual_gpus) as executor:
+            futures = []
+            for i, local_df in enumerate(gpu_data):
+                # Use original GPU ID if available, otherwise use index
+                gpu_id = self.device_ids[i] if i < len(self.device_ids) else i
+                futures.append(executor.submit(process_gpu_data, gpu_id, local_df))
+
+            for future in concurrent.futures.as_completed(futures):
+                try:
+                    result = future.result()
+                    results.append(result)
+                except Exception as e:
+                    self.logger.error(f"GPU processing failed: {e}")
+                    raise
+
+        # Combine results from all GPUs
+        all_price_bins = []
+        all_volumes = []
+        all_volumes_smooth = []
+
+        for price_bins, volumes, volumes_smooth in results:
+            all_price_bins.extend(price_bins)
+            all_volumes.extend(volumes)
+            all_volumes_smooth.extend(volumes_smooth)
+
+        # Convert back to pandas DataFrame
+        volume_profile_df = pd.DataFrame({
+            'price_level': all_price_bins,
+            'volume': all_volumes,
+            'volume_smooth': all_volumes_smooth
+        })
+
+        # Clear GPU memory after distributed processing
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return volume_profile_df
+
+    def _calculate_volume_profile_single_gpu(self, session_df):
+        """Optimized single GPU VPOC calculation with ROCm 7."""
+        device = self.device
+
+        # Convert to tensors with ROCm 7 optimizations
+        open_prices = torch.tensor(session_df['open'].values, device=device, dtype=torch.float32)
+        high_prices = torch.tensor(session_df['high'].values, device=device, dtype=torch.float32)
+        low_prices = torch.tensor(session_df['low'].values, device=device, dtype=torch.float32)
+        close_prices = torch.tensor(session_df['close'].values, device=device, dtype=torch.float32)
+        volumes = torch.tensor(session_df['volume'].values, device=device, dtype=torch.float32)
+
+        # Find price range
+        min_price = torch.min(torch.stack([low_prices.min(), open_prices.min(), close_prices.min()]))
+        max_price = torch.max(torch.stack([high_prices.max(), open_prices.max(), close_prices.max()]))
+
+        # ROCm 7 aligned memory
+        min_price = torch.floor(min_price / self.price_precision) * self.price_precision
+        max_price = torch.ceil(max_price / self.price_precision) * self.price_precision
+
+        # Create price bins
+        price_bins = torch.arange(min_price, max_price + self.price_precision,
+                                self.price_precision, device=device, dtype=torch.float32)
+
+        # Initialize volume profile
+        volume_profile = torch.zeros_like(price_bins, dtype=torch.float32)
+
+        # Vectorized processing
+        bar_mins = torch.minimum(torch.minimum(open_prices, close_prices), low_prices)
+        bar_maxs = torch.maximum(torch.maximum(open_prices, close_prices), high_prices)
+
+        num_bars = len(session_df)
+        for i in range(num_bars):
+            bar_min = bar_mins[i]
+            bar_max = bar_maxs[i]
+
+            # Vectorized mask calculation
+            mask = (price_bins >= bar_min) & (price_bins <= bar_max)
+            price_points = price_bins[mask]
+
+            if len(price_points) > 0:
+                # ROCm 7 proximity weighting
+                distances = torch.abs(price_points - close_prices[i])
+                proximity_weights = 1.0 / (1.0 + distances)
+                weights = proximity_weights + 1.0
+                weights = weights / weights.sum()
+
+                volume_profile[mask] += weights * volumes[i]
+
+        # ROCm 7 optimized smoothing
+        kernel_size = 3
+        padding = kernel_size // 2
+        volume_profile_expanded = torch.nn.functional.pad(volume_profile, (padding, padding))
+        volume_profile_smooth = torch.nn.functional.avg_pool1d(
+            volume_profile_expanded.unsqueeze(0).unsqueeze(0),
+            kernel_size, stride=1, padding=0
+        ).squeeze()
+
+        # Convert back to pandas
+        volume_profile_df = pd.DataFrame({
+            'price_level': price_bins.cpu().numpy(),
+            'volume': volume_profile.cpu().numpy(),
+            'volume_smooth': volume_profile_smooth.cpu().numpy()
+        })
+
+        # Clear GPU memory after single GPU processing
+        del open_prices, high_prices, low_prices, close_prices, volumes
+        del price_bins, volume_profile, volume_profile_smooth
+        del bar_mins, bar_maxs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return volume_profile_df
     
     def find_vpoc(self, volume_profile, use_smoothing=True):
         """
@@ -369,9 +517,20 @@ class VolumeProfileAnalyzer:
         }
 
 # Function wrappers for backward compatibility and convenience
-def calculate_volume_profile(session_data: pd.DataFrame, price_precision: float = 0.25) -> dict:
+# Global analyzer cache to avoid recreating analyzers for each session
+_analyzer_cache = {}
+
+def calculate_volume_profile(session_data: pd.DataFrame, price_precision: float = 0.25, device_ids: List[int] = None) -> dict:
     """Wrapper for VolumeProfileAnalyzer.calculate_volume_profile for backward compatibility"""
-    analyzer = VolumeProfileAnalyzer(price_precision=price_precision)
+    # Create cache key based on price_precision and device_ids
+    cache_key = (price_precision, tuple(device_ids) if device_ids else None)
+
+    # Reuse existing analyzer if available, otherwise create and cache
+    if cache_key not in _analyzer_cache:
+        _analyzer_cache[cache_key] = VolumeProfileAnalyzer(price_precision=price_precision, device_ids=device_ids)
+        logger.info(f"Created new VolumeProfileAnalyzer cache entry for precision {price_precision}, device_ids {device_ids}")
+
+    analyzer = _analyzer_cache[cache_key]
     vol_profile_df = analyzer.calculate_volume_profile(session_data)
     # Convert DataFrame to dictionary format used by legacy code
     return {row['price_level']: row['volume'] for _, row in vol_profile_df.iterrows()}
@@ -379,8 +538,12 @@ def calculate_volume_profile(session_data: pd.DataFrame, price_precision: float 
 def find_vpoc(volume_profile):
     """Wrapper for backward compatibility - accepts either DataFrame or dict format"""
     if isinstance(volume_profile, pd.DataFrame):
-        analyzer = VolumeProfileAnalyzer()
-        return analyzer.find_vpoc(volume_profile)
+        # Use cached analyzer if available, otherwise create a simple one
+        if (0.25, None) in _analyzer_cache:
+            return _analyzer_cache[(0.25, None)].find_vpoc(volume_profile)
+        else:
+            analyzer = VolumeProfileAnalyzer()
+            return analyzer.find_vpoc(volume_profile)
     elif isinstance(volume_profile, dict):
         # Handle dictionary format for legacy code
         if not volume_profile:

@@ -51,10 +51,15 @@ def test_model_manager():
         scaler = None
 
     test_filename = "test_model.pt"
+
+    # Set feature columns on model for saving
+    model.feature_columns = feature_columns
     save_path = manager.save_model(
         model,
-        feature_columns=feature_columns,
-        scaler=scaler,
+        optimizer=None,
+        epoch=10,
+        loss=0.123,
+        metadata={'scaler': 'StandardScaler instance' if scaler else None},
         filename=test_filename
     )
 

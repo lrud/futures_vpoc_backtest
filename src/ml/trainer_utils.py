@@ -42,25 +42,47 @@ def set_random_seed(seed: int):
 
 def get_gpu_metrics(device_ids=None):
     """Get memory and utilization metrics for specified GPUs.
-    
+
     Args:
-        device_ids: List of GPU IDs to check (None for all)
-        
+        device_ids: List of GPU IDs to check (None for all visible GPUs)
+
     Returns:
         Dict of {gpu_id: {'memory': (used, total), 'utilization': percent}}
     """
     metrics = {}
-    device_ids = device_ids or range(torch.cuda.device_count())
-    
-    for i in device_ids:
-        mem = torch.cuda.memory_stats(i)
-        metrics[i] = {
-            'memory': (
-                mem['allocated_bytes.all.current'] / 1024**2,
-                torch.cuda.get_device_properties(i).total_memory / 1024**2
-            ),
-            'utilization': torch.cuda.utilization(i)
-        }
+
+    # Only check visible GPUs to avoid runtime errors
+    visible_device_count = torch.cuda.device_count()
+    device_ids = device_ids or range(visible_device_count)
+
+    # Filter device_ids to only include visible devices
+    valid_device_ids = [i for i in device_ids if i < visible_device_count]
+
+    for i in valid_device_ids:
+        try:
+            mem = torch.cuda.memory_stats(i)
+            utilization = torch.cuda.utilization(i)
+            metrics[i] = {
+                'memory': (
+                    mem['allocated_bytes.all.current'] / 1024**2,
+                    torch.cuda.get_device_properties(i).total_memory / 1024**2
+                ),
+                'utilization': utilization
+            }
+        except (RuntimeError, IndexError) as e:
+            # Handle cases where GPU is not visible or accessible
+            if "device" in str(e).lower() and ("not visible" in str(e).lower() or "out of range" in str(e).lower()):
+                metrics[i] = {
+                    'memory': (0, 0),
+                    'utilization': 0
+                }
+                logger.warning(f"GPU {i} not accessible, using default metrics")
+            else:
+                logger.warning(f"Failed to get metrics for GPU {i}: {e}")
+                metrics[i] = {
+                    'memory': (0, 0),
+                    'utilization': 0
+                }
     return metrics
 
 def log_gpu_metrics(metrics, logger=None):
@@ -73,40 +95,63 @@ def log_gpu_metrics(metrics, logger=None):
     logger = logger or globals().get('logger')
     for gpu_id, data in metrics.items():
         used, total = data['memory']
-        logger.info(
-            f"GPU {gpu_id}: {used:.1f}/{total:.1f} MB ({used/total*100:.1f}%) "
-            f"utilization: {data['utilization']}%"
-        )
+        if total > 0:  # Avoid division by zero
+            logger.info(
+                f"GPU {gpu_id}: {used:.1f}/{total:.1f} MB ({used/total*100:.1f}%) "
+                f"utilization: {data['utilization']}%"
+            )
+        else:
+            logger.info(
+                f"GPU {gpu_id}: {used:.1f} MB (unknown total) "
+                f"utilization: {data['utilization']}%"
+            )
 
 def setup_rocm_environment():
-    """Set up ROCm environment for optimal performance with dual 7900 XT GPUs."""
+    """Set up ROCm 7 environment for optimal performance with dual 7900 XT GPUs."""
     if not torch.cuda.is_available():
         logger.warning("ROCm setup called but no AMD GPUs detected!")
         return False
 
     # Verify ROCm version and GPU count
     gpu_count = torch.cuda.device_count()
-    logger.info(f"Detected {gpu_count} AMD GPU(s)")
-    
-    # Multi-GPU specific optimizations
+    logger.info(f"Detected {gpu_count} AMD GPU(s) - Applying ROCm 7 optimizations")
+
+    # Memory leak prevention settings
+    os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128,expandable_segments:True'
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'  # For better error handling
+
+    # ROCm 7 Core Performance Optimizations
     os.environ['HSA_ENABLE_SDMA'] = '0'
+    os.environ['HSA_ENABLE_INTERRUPT'] = '0'
+    os.environ['HSA_UNALIGNED_ACCESS_MODE'] = '1'
     os.environ['GPU_MAX_HW_QUEUES'] = '8'
+    os.environ['GPU_MAX_ALLOC_PERCENT'] = '100'
     os.environ['HSA_MAX_QUEUES'] = '36'
     os.environ['HIP_HIDDEN_FREE_MEM'] = '256'
-    
-    # Enhanced PyTorch ROCm optimizations
+
+    # ROCm 7 PyTorch Optimizations (from documentation)
     os.environ['PYTORCH_ROCM_FUSION'] = '1'
     os.environ['PYTORCH_JIT_USE_NNC_NOT_NVFUSER'] = '1'
-    os.environ['PYTORCH_ROCM_WAVE32_MODE'] = '1'
+    os.environ['PYTORCH_ROCM_WAVE32_MODE'] = '1'  # Wave32 optimization for RDNA3
     os.environ['GPU_SINGLE_ALLOC_PERCENT'] = '90'  # Lower for multi-GPU
-    
-    # Multi-GPU communication optimizations
-    os.environ['HSA_ENABLE_INTERRUPT'] = '0'
-    os.environ['HSA_ENABLE_WAIT_COMPLETION'] = '0'
-    os.environ['NCCL_DEBUG'] = 'WARN'
+    os.environ['PYTORCH_HIP_ALLOC_CONF'] = 'max_split_size_mb:128'  # Memory fragmentation fix
+
+    # ROCm 7 RCCL Communication Optimizations (from documentation)
+    os.environ['RCCL_SOCKET_FAMILY'] = 'AF_INET'
+    os.environ['RCCL_IB_DISABLE'] = '0'                     # Enable InfiniBand support
+    os.environ['RCCL_NET_GDR_LEVEL'] = '3'                  # Enable GPUDirect RDMA
+    os.environ['RCCL_TREE_THRESHOLD'] = '0'                # Use tree algorithm
+    os.environ['RCCL_RING_THRESHOLD'] = '0'                # Ring algorithm fallback
+    os.environ['RCCL_MAX_NCHANNELS'] = '8'                 # Max communication channels
+    os.environ['RCCL_BUFFSIZE'] = '8388608'                # Buffer size (8MB)
+    os.environ['NCCL_DEBUG'] = 'WARN'                      # Reduced debug overhead
     os.environ['NCCL_SOCKET_IFNAME'] = 'lo'
     os.environ['NCCL_NSOCKS_PERTHREAD'] = '8'
-    
+
+    # ROCm 7 MIOpen Cache Optimizations (from documentation)
+    os.environ['MIOPEN_USER_DB_PATH'] = '/tmp/miopen_user_db'
+    os.environ['MIOPEN_CUSTOM_CACHE_DIR'] = '/tmp/miopen_cache'
+
     # Memory and thread optimization
     os.environ['OMP_NUM_THREADS'] = str(os.cpu_count() // 4)  # More conservative
     os.environ['ROCM_LAZY_MEM_ALLOC'] = '1'
@@ -124,10 +169,10 @@ def setup_rocm_environment():
     logger.info(f"ROCm environment optimized for {gpu_count} 7900 XT GPUs")
     return True
 
-def prepare_data(args, contract_filter=None, data_path=None, device_ids=None):
+def prepare_data(args, contract_filter=None, data_path=None, device_ids=None, data_fraction=1.0):
     """
     Load and prepare data for training using FeatureEngineer.
-    
+
     Parameters:
     -----------
     args: argparse.Namespace
@@ -138,13 +183,15 @@ def prepare_data(args, contract_filter=None, data_path=None, device_ids=None):
         Explicit data path to use (overrides args.data_path)
     device_ids: Optional[List[int]]
         List of GPU device IDs for distributed data loading
+    data_fraction: float
+        Fraction of data to use (0.1 = 10%, 1.0 = 100%)
         
     Returns:
     --------
     tuple or None
         (X_train, y_train, X_val, y_val, feature_columns) or None if failed
     """
-    feature_engineer = FeatureEngineer()
+    feature_engineer = FeatureEngineer(device_ids=device_ids)
     try:
         # Use explicit data_path if provided, otherwise try args.data_path, fall back to settings.DATA_DIR
         path = data_path if data_path else (
@@ -152,7 +199,9 @@ def prepare_data(args, contract_filter=None, data_path=None, device_ids=None):
         )
         return feature_engineer.load_and_prepare_data(
             data_path=path,
-            contract_filter=contract_filter
+            contract_filter=contract_filter,
+            device_ids=device_ids,
+            data_fraction=data_fraction
         )
     except Exception as e:
         logger.error(f"Data preparation failed: {e}")

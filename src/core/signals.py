@@ -276,14 +276,21 @@ class SignalGenerator:
         
         self.logger.info(f"Generating ML signals from {len(features_df)} sessions")
         
-        # Extract feature columns that model expects
+        # Extract feature columns from the actual DataFrame
+        # Use actual column names instead of placeholder names from model
+        non_feature_cols = {'date', 'signal_type', 'signal', 'confidence', 'contract', 'session'}
+        feature_cols = [col for col in features_df.columns if col not in non_feature_cols]
+
+        # Validate we have the right number of features
         if hasattr(model, 'feature_columns'):
-            feature_cols = model.feature_columns
+            expected_features = len(model.feature_columns)
         else:
-            # Make a best guess based on typical features
-            feature_cols = [col for col in features_df.columns 
-                          if col not in ['date', 'signal_type', 'signal', 'confidence']]
-        
+            # Infer expected features from model input dimension
+            expected_features = features_df.shape[1] - len(non_feature_cols)
+
+        if len(feature_cols) != expected_features:
+            self.logger.warning(f"Feature count mismatch: expected {expected_features}, got {len(feature_cols)}")
+
         # Select and scale features
         X = features_df[feature_cols].values
         scaler = StandardScaler()
