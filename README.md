@@ -9,7 +9,14 @@ Advanced algorithmic trading strategy for E-mini S&P 500 (ES) futures that combi
 
 **Hybrid Approach**: Combines rule-based VPOC analysis with PyTorch neural network filtering. The ML model acts as an intelligent filter on the original VPOC signals to improve trade quality and selectivity.
 
-## Strategy Performance (March 10, 2025)
+## Strategy Performance & Recent Updates
+
+### Latest Updates (October 2025)
+- **ROCm 7 Support**: Added distributed training with DataParallel for improved multi-GPU performance
+- **Enhanced Test Suite**: Comprehensive testing for GARCH models, VPOC implementation, and distributed training
+- **Documentation Consolidation**: All guides consolidated into `documentation/` folder
+- **GPU Monitoring**: Added scripts for GPU memory monitoring and safe training
+- **PyTorch Updates**: Updated to support PyTorch 2.4+ with ROCm 7 optimizations
 
 ### Original VPOC Strategy
 - **Total Trades**: 1,649
@@ -27,6 +34,8 @@ Advanced algorithmic trading strategy for E-mini S&P 500 (ES) futures that combi
 - **Profit Factor**: 2.34
 - **Sharpe Ratio**: 4.52
 - **Max Drawdown**: -3.60%
+
+⚠️ **Technical Difficulties**: Current implementation is experiencing issues with the latest iteration of VPOC calculations, GARCH volatility modeling, and log transformations. The development team is working to resolve these compatibility issues with the updated dependencies.
 
 ![Strategy Comparison](strategy_comparison.png)
 
@@ -70,11 +79,13 @@ Advanced algorithmic trading strategy for E-mini S&P 500 (ES) futures that combi
 
 ### 4. Machine Learning Enhancement (`src/ml/`) - The Intelligent Filter
 **AMD GPU-Optimized Architecture** (`src/ml/model.py`):
+- **ROCm 7 Support**: Updated with ROCm 7 optimizations and DataParallel multi-GPU training
 - **ROCm 6.3.3 Optimized**: Specifically tuned for AMD 7900 XT with RDNA3 architecture
 - **Memory Alignment**: 64-byte alignment for optimal cache usage, 32-element dimensions for Wave32 mode
 - **Advanced Features**: LayerNorm instead of GroupNorm, SiLU activation with PyTorch JIT fusion
 - **Flash Attention v3**: Support for efficient processing
 - **Mixed Precision**: BF16 training for performance optimization
+- **Distributed Training**: Enhanced multi-GPU support with ROCm 7 DataParallel
 
 **Feature Engineering** (`src/ml/feature_engineering.py`):
 - **Multi-Timeframe Analysis**: 5, 10, 20, 50-day lookback periods
@@ -183,16 +194,28 @@ futures_vpoc_backtest/
 │   ├── tests/              # Additional tests (e.g., integration)
 │   │   └── test_ml_backtest.py     # ML backtest specific tests
 │   └── utils/              # Utility functions
-├── NOTEBOOKS/              # Original implementation
-│   ├── VPOC.py            # Volume profile analysis & calculations
-│   ├── STRATEGY.py        # Trading signal generation
-│   ├── BACKTEST.py        # Performance testing & risk management
-│   ├── MATH.py            # Statistical validation tools
-│   ├── DATA_LOADER.py     # Data preprocessing utilities
-│   ├── ML_TEST.py         # Original ML model architecture and training
-│   └── ML_BACKTEST.py     # ML-enhanced backtesting framework
+├── DEPRECATED_NOTEBOOKS/  # Original implementation (deprecated)
+├── documentation/         # Consolidated documentation
+│   ├── Installation_Setup_Guide.md
+│   ├── ML_Training_Guide.md
+│   ├── Project_Architecture_Guide.md
+│   ├── Quick_Start_Guide.md
+│   ├── Backtesting_Strategy_Guide.md
+│   ├── ROCm_7_Distributed_ML_Reference.md
+│   ├── PyTorch_2_4_Distributed_ML_Reference.md
+│   └── TRAINING_GUIDE.md
+├── TESTS/                 # Enhanced test suite
+│   ├── test_garch_fix.py
+│   ├── test_model_performance.py
+│   ├── test_rocm7_distributed_training.py
+│   └── test_vpoc_implementation.py
+├── scripts/               # Utility scripts
+│   ├── gpu_memory_monitor.sh
+│   └── safe_train.sh
+├── TRAINING_RESULTS.md    # Training results and performance
 ├── DATA/                  # Data directory (not included in repo)
-├── TRAINING/              # Model training outputs (not included in repo)
+├── BACKTEST_LOG/          # Backtest logs (not included in repo)
+├── logs/                  # System logs (not included in repo)
 └── .gitignore             # Git ignore rules
 ```
 ## Installation & Usage
@@ -262,6 +285,12 @@ python BACKTEST.py   # Simple backtesting
 
 ### 4. Testing and Validation
 ```bash
+# Enhanced test suite (new additions)
+python TESTS/test_rocm7_distributed_training.py  # ROCm 7 distributed training tests
+python TESTS/test_vpoc_implementation.py         # VPOC implementation tests
+python TESTS/test_garch_fix.py                   # GARCH model fixes tests
+python TESTS/test_model_performance.py           # Model performance tests
+
 # Run comprehensive tests
 python src/scripts/test_ML_total.py        # End-to-end integration test
 python src/scripts/test_model.py          # Model architecture validation
@@ -270,6 +299,10 @@ python src/tests/test_ml_backtest.py      # ML backtest validation
 
 # Quick feature validation
 python src/scripts/test_feature_engineering.py
+
+# Enhanced backtesting tests
+python src/scripts/test_enhanced_backtest.py
+python src/scripts/test_enhanced_model_backtest.py
 ```
 
 ### Key Scripts & Their Purposes
@@ -293,7 +326,8 @@ python src/scripts/test_feature_engineering.py
 - **`matplotlib/seaborn`**: Visualization for results and analysis
 
 ### Hardware-Specific:
-- **AMD ROCm 6.3.3+**: Required for GPU acceleration optimizations
+- **AMD ROCm 7+**: Latest ROCm 7 support with DataParallel multi-GPU training
+- **AMD ROCm 6.3.3+**: Still supported for backwards compatibility
 - **PyTorch with ROCm**: Specialized build for AMD GPUs
 - **CUDA (optional)**: Fallback for NVIDIA GPU support
 
@@ -301,8 +335,11 @@ python src/scripts/test_feature_engineering.py
 ```bash
 pip install -r requirements.txt
 
-# For AMD GPU support (ROCm 6.3.3+)
+# For AMD GPU support (ROCm 7 - recommended)
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.0
+
+# For distributed training with ROCm 7
+python TESTS/test_rocm7_distributed_training.py  # Verify setup
 ```
 
 ## System Innovations & Technical Highlights
