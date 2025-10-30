@@ -1,33 +1,42 @@
 # Data Analysis
-pandas>=2.0.0,<2.2.0
-numpy>=1.22.4,<1.26.0
+pandas>=2.0.0
+numpy>=1.26.0
+
 
 # Scientific Computing
 scipy>=1.10.0
+
 
 # Visualization
 matplotlib>=3.7.0
 seaborn>=0.12.0
 
+
 # Data Processing
 pytz>=2023.3
 python-dateutil>=2.8.2
 
-# Technical Analysis
-pandas-ta>=0.3.14b0
+
+# Technical Analysis (optional - removed pandas-ta due to Python 3.11 compatibility issues)
+# pandas-ta can be installed manually if needed: pip install pandas-ta==0.3.14b0
+
 
 # Statistics
 statsmodels>=0.14.0
 
+
 # File Handling
 openpyxl>=3.1.0
+
 
 # Claude API client
 anthropic>=0.18.0
 
+
 # Machine Learning (PyTorch ecosystem)
-torch>=2.0.0,<2.2.0
+# PyTorch is installed in Dockerfile with ROCm support
 scikit-learn>=1.3.0
+
 
 # Optional: Distributed training (uncomment if needed)
 # mpi4py>=3.1.0

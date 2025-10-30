@@ -11,9 +11,10 @@ logger = get_logger(__name__)
 class VolumeProfileAnalyzer:
     """Handles volume profile analysis, VPOC, and value area calculations with ROCm 7 multi-GPU optimization."""
 
-    def __init__(self, price_precision=None, device='cuda', device_ids=None):
+    def __init__(self, price_precision=None, device='cuda', device_ids=None, chunk_size=3500):
         self.logger = get_logger(__name__)
         self.price_precision = price_precision or settings.PRICE_PRECISION
+        self.chunk_size = chunk_size
 
         # ROCm 7 optimizations
         os.environ['HIP_VISIBLE_DEVICES'] = ','.join(map(str, device_ids or [0]))
@@ -438,10 +439,102 @@ class VolumeProfileAnalyzer:
 
         return val, vah, va_volume_pct
     
+    def _calculate_volume_profile_chunked(self, session_df):
+        """
+        ROCm 7 SOLUTION 2: Chunked VPOC calculation to prevent VRAM fragmentation.
+        Processes large sessions in 3500-bar chunks with aggressive memory cleanup.
+        """
+        self.logger.info(f"ROCm 7: Processing {len(session_df)} bars in chunks to prevent VRAM fragmentation")
+
+        chunk_size = self.chunk_size  # Use configured chunk size
+        total_bars = len(session_df)
+        num_chunks = (total_bars + chunk_size - 1) // chunk_size
+
+        self.logger.info(f"ROCm 7: Splitting into {num_chunks} chunks of {chunk_size} bars each")
+
+        # Process session in chunks and combine results
+        all_volume_profiles = []
+
+        for chunk_idx in range(num_chunks):
+            start_idx = chunk_idx * chunk_size
+            end_idx = min(start_idx + chunk_size, total_bars)
+
+            chunk_df = session_df.iloc[start_idx:end_idx].copy()
+
+            self.logger.debug(f"ROCm 7: Processing chunk {chunk_idx + 1}/{num_chunks}, bars {start_idx}-{end_idx}")
+
+            try:
+                # Calculate volume profile for this chunk using single GPU method
+                chunk_profile_df = self._calculate_volume_profile_single_gpu(chunk_df)
+                all_volume_profiles.append(chunk_profile_df)
+
+                # ROCm 7: Aggressive memory cleanup after each chunk
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                    # Force garbage collection
+                    import gc
+                    gc.collect()
+
+                self.logger.debug(f"ROCm 7: Completed chunk {chunk_idx + 1}/{num_chunks}, memory cleaned up")
+
+            except Exception as e:
+                self.logger.error(f"ROCm 7: Failed to process chunk {chunk_idx + 1}: {e}")
+                # Fall back to CPU for this chunk
+                self.logger.info(f"ROCm 7: Falling back to CPU for chunk {chunk_idx + 1}")
+                chunk_profile_df = self._calculate_volume_profile_cpu(chunk_df)
+                all_volume_profiles.append(chunk_profile_df)
+
+        # Combine all chunk results
+        self.logger.info("ROCm 7: Combining volume profiles from all chunks")
+
+        if not all_volume_profiles:
+            raise ValueError("No volume profiles were generated from any chunks")
+
+        # Combine all volume profiles by merging price levels and summing volumes
+        combined_profile = pd.DataFrame(columns=['price_level', 'volume', 'volume_smooth'])
+
+        for profile in all_volume_profiles:
+            if combined_profile.empty:
+                combined_profile = profile.copy()
+            else:
+                # Merge price levels and sum volumes
+                for _, row in profile.iterrows():
+                    price_level = row['price_level']
+                    existing_idx = combined_profile[combined_profile['price_level'] == price_level].index
+
+                    if len(existing_idx) > 0:
+                        # Add to existing price level
+                        idx = existing_idx[0]
+                        combined_profile.loc[idx, 'volume'] += row['volume']
+                        combined_profile.loc[idx, 'volume_smooth'] += row.get('volume_smooth', row['volume'])
+                    else:
+                        # Add new price level
+                        new_row = pd.DataFrame([row])
+                        combined_profile = pd.concat([combined_profile, new_row], ignore_index=True)
+
+        # Sort by price level and recalculate smoothing
+        combined_profile = combined_profile.sort_values('price_level').reset_index(drop=True)
+
+        # Recalculate smoothed volume across combined profile
+        if len(combined_profile) > 0:
+            combined_profile['volume_smooth'] = combined_profile['volume'].rolling(window=3, center=True, min_periods=1).mean()
+            combined_profile['volume_smooth'] = combined_profile['volume_smooth'].fillna(combined_profile['volume'])
+
+        self.logger.info(f"ROCm 7: Combined volume profile created with {len(combined_profile)} price levels")
+
+        # Final aggressive memory cleanup
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            import gc
+            gc.collect()
+
+        # Convert to dictionary format for legacy compatibility
+        return {row['price_level']: row['volume'] for _, row in combined_profile.iterrows()}
+
     def _calculate_volume_profile_cpu(self, session_df):
         """Fallback CPU implementation of volume profile calculation"""
         self.logger.debug("Using CPU implementation for volume profile")
-        
+
         # Find min and max prices
         min_price = min(session_df['low'].min(), session_df['open'].min(), session_df['close'].min())
         max_price = max(session_df['high'].max(), session_df['open'].max(), session_df['close'].max())
@@ -520,20 +613,27 @@ class VolumeProfileAnalyzer:
 # Global analyzer cache to avoid recreating analyzers for each session
 _analyzer_cache = {}
 
-def calculate_volume_profile(session_data: pd.DataFrame, price_precision: float = 0.25, device_ids: List[int] = None) -> dict:
-    """Wrapper for VolumeProfileAnalyzer.calculate_volume_profile for backward compatibility"""
-    # Create cache key based on price_precision and device_ids
-    cache_key = (price_precision, tuple(device_ids) if device_ids else None)
+def calculate_volume_profile(session_data: pd.DataFrame, price_precision: float = 0.25, device_ids: List[int] = None, chunk_size: int = 3500) -> dict:
+    """Wrapper for VolumeProfileAnalyzer.calculate_volume_profile for backward compatibility with ROCm 7 chunked processing"""
+    # Create cache key based on price_precision, device_ids, and chunk_size
+    cache_key = (price_precision, tuple(device_ids) if device_ids else None, chunk_size)
 
     # Reuse existing analyzer if available, otherwise create and cache
     if cache_key not in _analyzer_cache:
-        _analyzer_cache[cache_key] = VolumeProfileAnalyzer(price_precision=price_precision, device_ids=device_ids)
-        logger.info(f"Created new VolumeProfileAnalyzer cache entry for precision {price_precision}, device_ids {device_ids}")
+        _analyzer_cache[cache_key] = VolumeProfileAnalyzer(price_precision=price_precision, device_ids=device_ids, chunk_size=chunk_size)
+        logger.info(f"Created new VolumeProfileAnalyzer cache entry for precision {price_precision}, device_ids {device_ids}, chunk_size {chunk_size}")
 
     analyzer = _analyzer_cache[cache_key]
-    vol_profile_df = analyzer.calculate_volume_profile(session_data)
-    # Convert DataFrame to dictionary format used by legacy code
-    return {row['price_level']: row['volume'] for _, row in vol_profile_df.iterrows()}
+
+    # ROCm 7 SOLUTION 2: Chunked VPOC calculations for memory fragmentation fix
+    # For large sessions (>1000 bars), process in chunks to prevent VRAM fragmentation
+    if len(session_data) > 1000:
+        logger.info(f"ROCm 7: Using chunked VPOC calculation for {len(session_data)} bars")
+        return analyzer._calculate_volume_profile_chunked(session_data)
+    else:
+        vol_profile_df = analyzer.calculate_volume_profile(session_data)
+        # Convert DataFrame to dictionary format used by legacy code
+        return {row['price_level']: row['volume'] for _, row in vol_profile_df.iterrows()}
     
 def find_vpoc(volume_profile):
     """Wrapper for backward compatibility - accepts either DataFrame or dict format"""

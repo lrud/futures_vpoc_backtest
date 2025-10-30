@@ -113,9 +113,50 @@ class ModelTrainer(TrainingCore):
         y_val_tensor = (y_val_tensor + 1) / 2  # Convert from [-1, 1] to [0, 1]
         
         return train_loader, (X_val_tensor, y_val_tensor)
-    
-    def _train_epoch(self, train_loader):
-        """Run one training epoch with enhanced progress monitoring."""
+
+    def _save_checkpoint(self, batch_idx, epoch, avg_loss):
+        """Save training checkpoint for resuming after OOM errors."""
+        try:
+            import os
+            import torch
+
+            checkpoint_path = os.path.join(self.model_manager.model_dir, 'checkpoint.pt')
+            checkpoint = {
+                'epoch': epoch,
+                'batch_idx': batch_idx,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scaler_state_dict': self.scaler.state_dict() if self.scaler else None,
+                'avg_loss': avg_loss,
+                'gradient_accumulation_steps': getattr(self, '_last_gradient_accumulation_steps', 1)
+            }
+
+            torch.save(checkpoint, checkpoint_path)
+            self.logger.info(f"💾 Checkpoint saved: batch {batch_idx}, epoch {epoch}, loss {avg_loss:.6f}")
+
+        except Exception as e:
+            self.logger.warning(f"Failed to save checkpoint: {e}")
+
+    def _load_checkpoint(self):
+        """Load training checkpoint for resuming."""
+        try:
+            import os
+            import torch
+
+            checkpoint_path = os.path.join(self.model_manager.model_dir, 'checkpoint.pt')
+            if not os.path.exists(checkpoint_path):
+                return None
+
+            checkpoint = torch.load(checkpoint_path, map_location=self.device)
+            self.logger.info(f"📂 Loaded checkpoint: batch {checkpoint['batch_idx']}, epoch {checkpoint['epoch']}")
+            return checkpoint
+
+        except Exception as e:
+            self.logger.warning(f"Failed to load checkpoint: {e}")
+            return None
+
+    def _train_epoch(self, train_loader, args=None, epoch_num=1):
+        """Run one training epoch with enhanced progress monitoring and memory management."""
         from src.ml.trainer_utils import get_gpu_metrics, log_gpu_metrics
 
         self.model.train()
@@ -123,6 +164,21 @@ class ModelTrainer(TrainingCore):
         samples_processed = 0
         batch_count = len(train_loader)
         epoch_start_time = time.time()
+
+        # Get gradient accumulation steps from args (args can be dict or namespace)
+        if isinstance(args, dict):
+            gradient_accumulation_steps = int(args.get('gradient_accumulation_steps', 1))
+        else:
+            gradient_accumulation_steps = int(getattr(args, 'gradient_accumulation_steps', 1))
+        self.logger.info(f"    🔄 Using gradient accumulation: {gradient_accumulation_steps} steps")
+
+        # Store for checkpoint access
+        self._gradient_accumulation_steps = gradient_accumulation_steps
+
+        # ROCm 7 Memory Management: Clear cache before epoch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
 
         self.logger.info(f"    📦 Processing {batch_count} batches...")
 
@@ -133,6 +189,9 @@ class ModelTrainer(TrainingCore):
             gpu_metrics = get_gpu_metrics()
             log_gpu_metrics(gpu_metrics, self.logger)
 
+        # Zero gradients at the start of epoch
+        self.optimizer.zero_grad()
+
         for batch_idx, (inputs, targets) in enumerate(train_loader):
             batch_start_time = time.time()
             inputs, targets = inputs.to(self.device), targets.to(self.device)
@@ -141,30 +200,86 @@ class ModelTrainer(TrainingCore):
             if torch.cuda.is_available():
                 pre_forward_memory = torch.cuda.memory_allocated(self.device) / 1024**3
 
-            self.optimizer.zero_grad()
-
             try:
                 # Get model (compiled or original) for PyTorch 2.10 optimization
                 model_for_training = self.get_model_for_training()
 
+                # Initialize variables for logging and error handling
+                current_loss = 0.0
+                batch_size = 0
+                input_shape = None
+
                 if self.scaler:
                     with torch.cuda.amp.autocast():
-                        outputs = model_for_training(inputs).squeeze()
-                        loss = self.criterion(outputs, targets)
+                        outputs = model_for_training(inputs)
+                        # CRITICAL FIX: Model now outputs correct shape, no additional squeeze needed
+                        # Only squeeze if output has extra dimensions
+                        if outputs.dim() > 1 and outputs.size(1) == 1:
+                            outputs = outputs.squeeze(-1)
+                        # Scale loss by gradient accumulation steps
+                        loss = self.criterion(outputs, targets) / gradient_accumulation_steps
+
+                    # Gradient accumulation with mixed precision
                     self.scaler.scale(loss).backward()
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
+
+                    # Save loss value before cleanup for logging (unscaled)
+                    current_loss = loss.item() * gradient_accumulation_steps
+
+                    # Calculate running loss and save batch info before cleanup
+                    batch_size = inputs.size(0)
+                    input_shape = inputs.shape
+                    train_loss += loss.item() * gradient_accumulation_steps * batch_size
+
+                    # Step optimizer only after accumulation steps
+                    if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                        self.optimizer.zero_grad()
+
+                        self.logger.debug(f"    🔄 Optimizer step at batch {batch_idx + 1}")
+
+                    # CRITICAL: Aggressive memory cleanup every batch for ROCm fragmentation
+                    del outputs, targets, loss, inputs
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
                 else:
-                    outputs = model_for_training(inputs).squeeze()
-                    loss = self.criterion(outputs, targets)
+                    outputs = model_for_training(inputs)
+                    # CRITICAL FIX: Model now outputs correct shape, no additional squeeze needed
+                    # Only squeeze if output has extra dimensions
+                    if outputs.dim() > 1 and outputs.size(1) == 1:
+                        outputs = outputs.squeeze(-1)
+                    # Scale loss by gradient accumulation steps
+                    loss = self.criterion(outputs, targets) / gradient_accumulation_steps
+
+                    # Gradient accumulation
                     loss.backward()
-                    self.optimizer.step()
+
+                    # Save loss value before cleanup for logging (unscaled)
+                    current_loss = loss.item() * gradient_accumulation_steps
+
+                    # Calculate running loss and save batch info before cleanup
+                    batch_size = inputs.size(0)
+                    input_shape = inputs.shape
+                    train_loss += loss.item() * gradient_accumulation_steps * batch_size
+
+                    # Step optimizer only after accumulation steps
+                    if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                        self.optimizer.step()
+                        self.optimizer.zero_grad()
+
+                        self.logger.debug(f"    🔄 Optimizer step at batch {batch_idx + 1}")
+
+                    # CRITICAL: Aggressive memory cleanup every batch for ROCm fragmentation
+                    del outputs, targets, loss, inputs
+                    if torch.cuda.is_available():
+                        torch.cuda.synchronize()
+                        torch.cuda.empty_cache()
 
                 # Log batch progress (every 10 batches or first/last batch)
                 if batch_idx % 10 == 0 or batch_idx == batch_count - 1:
                     batch_time = time.time() - batch_start_time
                     progress_pct = (batch_idx + 1) / batch_count * 100
-                    current_loss = loss.item()
 
                     self.logger.info(f"      🔄 Batch {batch_idx+1}/{batch_count} ({progress_pct:.1f}%) "
                                    f"- Loss: {current_loss:.6f} - Time: {batch_time:.3f}s")
@@ -180,26 +295,67 @@ class ModelTrainer(TrainingCore):
                     gpu_metrics = get_gpu_metrics()
                     log_gpu_metrics(gpu_metrics, self.logger)
 
-                train_loss += loss.item() * inputs.size(0)
-                samples_processed += inputs.size(0)
+                # Checkpoint saving (every N batches)
+                checkpoint_interval = getattr(args, 'checkpoint_interval', 50)
+                if (batch_idx + 1) % checkpoint_interval == 0:
+                    self._save_checkpoint(batch_idx + 1, epoch_num, train_loss / samples_processed)
+
+                samples_processed += batch_size
+
+                # ROCm 7 Memory Management: Periodic cache clearing
+                if batch_idx % 20 == 0 and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             except RuntimeError as e:
                 if "out of memory" in str(e).lower():
                     self.logger.error(f"    ❌ GPU Out of Memory Error in batch {batch_idx+1}")
                     self.logger.error(f"    📊 Batch Details:")
-                    self.logger.error(f"      • Batch Size: {inputs.size(0)}")
-                    self.logger.error(f"      • Input Shape: {inputs.shape}")
-                    self.logger.error(f"      • Input Features: {inputs.shape[1]}")
+                    self.logger.error(f"      • Batch Size: {batch_size}")
+                    self.logger.error(f"      • Input Shape: {input_shape}")
+                    if input_shape is not None and len(input_shape) > 1:
+                        self.logger.error(f"      • Input Features: {input_shape[1]}")
+                    else:
+                        self.logger.error(f"      • Input Features: Unknown (input_shape is None)")
                     if torch.cuda.is_available():
                         oom_memory = torch.cuda.memory_allocated(self.device) / 1024**3
                         total_memory = torch.cuda.get_device_properties(self.device).total_memory / 1024**3
                         self.logger.error(f"      • GPU Memory Used: {oom_memory:.2f}GB / {total_memory:.2f}GB")
+
+                    # ROCm 7 Emergency cleanup
+                    self.logger.error("    🧹 Performing emergency GPU memory cleanup...")
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                        torch.cuda.synchronize()
+                        torch.cuda.reset_peak_memory_stats()
+
+                        # Clear DataParallel references if present
+                        if hasattr(self.model, 'module'):
+                            self.logger.info("    🔄 Clearing DataParallel references...")
+                            for param in self.model.parameters():
+                                if param.grad is not None:
+                                    param.grad = None
+
                     raise e
                 else:
                     raise e
 
+        # Final optimizer step for any remaining accumulated gradients
+        if (batch_count) % gradient_accumulation_steps != 0:
+            if self.scaler:
+                self.scaler.step(self.optimizer)
+                self.scaler.update()
+            else:
+                self.optimizer.step()
+            self.logger.info(f"    🔄 Final optimizer step after epoch (remaining {batch_count % gradient_accumulation_steps} gradients)")
+
         epoch_time = time.time() - epoch_start_time
         avg_loss = train_loss / samples_processed
+
+        # ROCm 7 Memory Management: Clear cache after epoch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
 
         self.logger.info(f"    ✅ Epoch Training Complete:")
         self.logger.info(f"      • Average Loss: {avg_loss:.6f}")
@@ -292,7 +448,8 @@ class ModelTrainer(TrainingCore):
         self.scaler = None
         if args.get('use_mixed_precision', False) and torch.cuda.is_available():
             self.logger.info("Using mixed precision training")
-            self.scaler = torch.cuda.amp.GradScaler()
+            # ROCm 7: Initialize scaler with memory management
+            self.scaler = torch.cuda.amp.GradScaler(enabled=True)
         
         # Training history
         history = {
@@ -300,7 +457,23 @@ class ModelTrainer(TrainingCore):
             'val_loss': [],
             'val_accuracy': []
         }
-        
+
+        # Checkpoint resuming support
+        resume_from_checkpoint = args.get('resume_from_checkpoint', False)
+        starting_epoch = 0
+        starting_batch = 0
+
+        if resume_from_checkpoint:
+            checkpoint = self._load_checkpoint()
+            if checkpoint:
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                if self.scaler and checkpoint['scaler_state_dict']:
+                    self.scaler.load_state_dict(checkpoint['scaler_state_dict'])
+                starting_epoch = checkpoint['epoch'] - 1  # -1 because loop is 0-indexed
+                starting_batch = checkpoint['batch_idx']
+                self.logger.info(f"🔄 Resuming from epoch {starting_epoch + 1}, batch {starting_batch}")
+
         # Enhanced training configuration logging
         self.logger.info("🚀 STARTING NEURAL NETWORK TRAINING")
         self.logger.info("=" * 60)
@@ -342,13 +515,13 @@ class ModelTrainer(TrainingCore):
         self.logger.info("🏃‍♂️ BEGINNING TRAINING EPOCHS")
         self.logger.info("=" * 60)
 
-        for epoch in range(args['epochs']):
+        for epoch in range(starting_epoch, args['epochs']):
             epoch_start_time = time.time()
             self.logger.info(f"\n📚 EPOCH {epoch+1}/{args['epochs']} - Starting...")
 
             # Training phase
             self.logger.info(f"  🔥 Training phase...")
-            train_loss = self._train_epoch(train_loader)
+            train_loss = self._train_epoch(train_loader, args, epoch + 1)
 
             # Validation phase
             self.logger.info(f"  ✅ Validation phase...")
@@ -381,12 +554,21 @@ class ModelTrainer(TrainingCore):
             self.logger.info(f"    • Total Time: {total_time:.2f}s")
             self.logger.info(f"    • ETA: {eta_minutes:.1f}min")
 
-            # Memory logging
+            # Memory logging with ROCm 7 enhancements
             if torch.cuda.is_available():
                 gpu_memory = torch.cuda.memory_allocated(self.device) / 1024**3
                 gpu_cached = torch.cuda.memory_reserved(self.device) / 1024**3
+                peak_memory = torch.cuda.max_memory_allocated(self.device) / 1024**3
+
                 self.logger.info(f"    • GPU Memory: {gpu_memory:.2f}GB allocated, {gpu_cached:.2f}GB cached")
-            
+                self.logger.info(f"    • Peak Memory: {peak_memory:.2f}GB")
+
+                # ROCm 7: Memory safety check and cleanup
+                if gpu_memory > 14.0:  # Warning threshold
+                    self.logger.warning(f"⚠️  High memory usage: {gpu_memory:.2f}GB - performing cleanup")
+                    torch.cuda.empty_cache()
+                    torch.cuda.synchronize()
+
             # Save best model
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -458,16 +640,46 @@ class ModelTrainer(TrainingCore):
             filename='model_final.pt'
         )
 
-        # Final memory cleanup logging
+        # Final memory cleanup logging with ROCm 7 enhancements
         if torch.cuda.is_available():
             final_memory = torch.cuda.memory_allocated(self.device) / 1024**3
+            final_cached = torch.cuda.memory_reserved(self.device) / 1024**3
             self.logger.info(f"🔧 FINAL GPU STATE:")
             self.logger.info(f"  • Memory Allocated: {final_memory:.2f}GB")
+            self.logger.info(f"  • Memory Reserved: {final_cached:.2f}GB")
 
-            # Clear cache
+            # ROCm 7: Comprehensive cleanup
+            self.logger.info("  🧹 Performing final cleanup...")
+
+            # Clear DataParallel references if present
+            if hasattr(self.model, 'module'):
+                self.logger.info("    • Clearing DataParallel references...")
+                # Move model back to single GPU before cleanup
+                if hasattr(self.model.module, 'cpu'):
+                    self.model.module.cpu()
+                for param in self.model.parameters():
+                    if param.grad is not None:
+                        param.grad = None
+
+            # Clear compiled model cache if present
+            if hasattr(self, 'compiled_model'):
+                self.logger.info("    • Clearing compiled model cache...")
+                self.compiled_model = None
+                self.use_compiled_model = False
+
+            # Clear mixed precision scaler
+            if hasattr(self, 'scaler') and self.scaler is not None:
+                self.logger.info("    • Clearing mixed precision scaler...")
+                self.scaler = None
+
+            # Clear all GPU caches and synchronize
             torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+
             cleared_memory = torch.cuda.memory_allocated(self.device) / 1024**3
-            self.logger.info(f"  • Memory After Cache Clear: {cleared_memory:.2f}GB")
+            cleared_cached = torch.cuda.memory_reserved(self.device) / 1024**3
+            self.logger.info(f"  • Memory After Cleanup: {cleared_memory:.2f}GB allocated, {cleared_cached:.2f}GB reserved")
 
         self.logger.info("=" * 60)
         self.logger.info("✅ READY FOR BACKTESTING!")
@@ -574,29 +786,19 @@ class ModelTrainer(TrainingCore):
             arch_name = "Generic ROCm"
 
         try:
-            # Compile model with PyTorch 2.10 optimizations
-            # Fix: Don't specify both mode and options
-            if compile_config['mode'] == 'max-autotune':
-                self.compiled_model = torch.compile(
-                    model,
-                    mode=compile_config['mode'],
-                    backend=compile_config['backend']
-                )
-            else:
-                self.compiled_model = torch.compile(
-                    model,
-                    backend=compile_config['backend']
-                )
+            # DISABLED: torch.compile due to ROCm version incompatibility
+            # torch.compile causes issues with ROCm/PyTorch version combinations
+            self.logger.warning(f"⚠️  torch.compile DISABLED due to ROCm version incompatibility")
+            self.logger.warning(f"   • PyTorch: {torch.__version__}")
+            if hasattr(torch.version, 'hip'):
+                self.logger.warning(f"   • ROCm/HIP: {torch.version.hip}")
+            self.logger.warning(f"   • Using original model for stability")
 
-            self.logger.info(f"🚀 PyTorch 2.10 torch.compile enabled for {arch_name}")
-            self.logger.info(f"  • Mode: {compile_config['mode']}")
-            self.logger.info(f"  • Backend: {compile_config['backend']}")
-
-            # Store reference to compiled model
-            self.use_compiled_model = True
+            self.compiled_model = model
+            self.use_compiled_model = False
 
         except Exception as e:
-            self.logger.warning(f"torch.compile failed: {e}")
+            self.logger.warning(f"Model setup failed: {e}")
             self.compiled_model = model
             self.use_compiled_model = False
 

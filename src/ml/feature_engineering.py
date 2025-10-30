@@ -23,7 +23,7 @@ class FeatureEngineer:
     Handles data loading, feature creation, transformation, and selection for ML models.
     """
     
-    def __init__(self, lookback_periods: List[int] = None, device_ids: List[int] = None):
+    def __init__(self, lookback_periods: List[int] = None, device_ids: List[int] = None, chunk_size: int = 3500):
         """
         Initialize feature engineering module.
 
@@ -33,6 +33,8 @@ class FeatureEngineer:
             Time periods for lookback features
         device_ids: List[int]
             List of GPU device IDs to use for parallel processing
+        chunk_size: int
+            VPOC chunk size for processing large sessions (default: 3500)
         """
         self.logger = get_logger(__name__)
         self.data_manager = FuturesDataManager()
@@ -46,6 +48,7 @@ class FeatureEngineer:
 
         # Store device IDs for multi-GPU VPOC processing
         self.device_ids = device_ids
+        self.chunk_size = chunk_size
 
         self.scaler = StandardScaler()
         self.feature_columns = []
@@ -259,7 +262,7 @@ class FeatureEngineer:
 
         return df
 
-    def load_and_prepare_data(self, data_path: str, contract_filter: Optional[str] = None, device_ids: List[int] = None, data_fraction: float = 1.0) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str]]:
+    def load_and_prepare_data(self, data_path: str, contract_filter: Optional[str] = None, device_ids: List[int] = None, data_fraction: float = 1.0, chunk_size: int = 3500) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, List[str]]:
         """
         Complete data loading and preparation pipeline.
         
@@ -284,40 +287,13 @@ class FeatureEngineer:
         - feature_columns: List of feature names
         """
         self.logger.info(f"Loading data from {data_path}")
-        
-        # Load raw data (distribute across GPUs if specified)
-        if device_ids and len(device_ids) > 1:
-            import torch
-            from torch.utils.data import DataLoader, TensorDataset
-            
-            # Load data normally first
-            if os.path.isfile(data_path):
-                data = self.data_manager.load_futures_data_file(data_path)
-            else:
-                data = self.data_manager.load_futures_data(data_path)
-            
-            # Convert to tensors and distribute
-            features_df = self.prepare_features(data)
 
-            # Create target variable using the enhanced robust target creation method
-            features_df = self.create_robust_target(features_df, target_type='log')
-
-            # Return numpy arrays like the single GPU path for consistency
-            X = features_df[self.feature_columns].values
-            y = features_df['target'].values
-
-            # Split into train/val
-            split_idx = int(len(X) * 0.8)
-            return (X[:split_idx], y[:split_idx],
-                   X[split_idx:], y[split_idx:],
-                   self.feature_columns)
+        # Load raw data
+        if os.path.isfile(data_path):
+            data = self.data_manager.load_futures_data_file(data_path)
         else:
-            # Single GPU/CPU path
-            if os.path.isfile(data_path):
-                data = self.data_manager.load_futures_data_file(data_path)
-            else:
-                data = self.data_manager.load_futures_data(data_path)
-        
+            data = self.data_manager.load_futures_data(data_path)
+
         if data is None or len(data) == 0:
             raise ValueError("Failed to load data or empty dataset")
 
@@ -334,16 +310,40 @@ class FeatureEngineer:
         if contract_filter:
             self.logger.info(f"Filtering for contract: {contract_filter}")
             matching_data = data[
-                (data['contract'].str.startswith(contract_filter)) | 
+                (data['contract'].str.startswith(contract_filter)) |
                 (data.get('contract_root', '') == contract_filter)
             ]
-            
+
             if len(matching_data) == 0:
                 self.logger.warning(f"No data found with contract {contract_filter}, using all data")
                 data['contract'] = contract_filter
                 data['contract_root'] = contract_filter
             else:
                 data = matching_data
+
+        # Handle multi-GPU processing
+        if device_ids and len(device_ids) > 1:
+            import torch
+            from torch.utils.data import DataLoader, TensorDataset
+
+            # Convert to tensors and distribute
+            features_df = self.prepare_features(data)
+
+            # Create target variable using the enhanced robust target creation method
+            features_df = self.create_robust_target(features_df, target_type='log')
+
+            # Return numpy arrays like the single GPU path for consistency
+            X = features_df[self.feature_columns].values
+            y = features_df['target'].values
+
+            # Split into train/val
+            split_idx = int(len(X) * 0.8)
+            return (X[:split_idx], y[:split_idx],
+                   X[split_idx:], y[split_idx:],
+                   self.feature_columns)
+        else:
+            # Single GPU/CPU path - data loading already done above
+            pass
                 
         # Generate features
         features_df = self.prepare_features(data)
@@ -442,7 +442,7 @@ class FeatureEngineer:
                 
             else:
                 # Create volume profile using imported functions with multi-GPU support
-                volume_profile = calculate_volume_profile(session_data, price_precision=0.25, device_ids=self.device_ids)
+                volume_profile = calculate_volume_profile(session_data, price_precision=0.25, device_ids=self.device_ids, chunk_size=self.chunk_size)
                 vpoc = find_vpoc(volume_profile)
                 val, vah, va_volume_pct = find_value_area(volume_profile)
             

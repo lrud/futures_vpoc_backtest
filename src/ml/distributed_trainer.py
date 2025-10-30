@@ -73,15 +73,16 @@ def _setup_process_group(rank, world_size):
         # Configure GPU with ROCm 7.0 optimizations
         torch.cuda.set_device(rank)
 
-        # PyTorch 2.10+ Flash Attention settings
+        # ROCm 7: DISABLED Flash Attention settings due to memory fragmentation
+        # These cause severe VRAM fragmentation in ROCm 7
         if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
-            torch.backends.cuda.enable_flash_sdp(True)
-            torch.backends.cuda.enable_mem_efficient_sdp(True)
-            torch.backends.cuda.enable_math_sdp(True)
+            torch.backends.cuda.enable_flash_sdp(False)  # Disabled for ROCm 7
+            torch.backends.cuda.enable_mem_efficient_sdp(False)  # Disabled for ROCm 7
+            torch.backends.cuda.enable_math_sdp(False)  # Disabled for ROCm 7
 
-        # Enable ROCm-specific optimizations
-        torch._C._jit_set_profiling_executor(False)
-        torch._C._jit_set_profiling_mode(False)
+        # ROCm 7: DISABLED JIT optimizations due to memory fragmentation
+        # torch._C._jit_set_profiling_executor(False)  # Disabled for ROCm 7
+        # torch._C._jit_set_profiling_mode(False)      # Disabled for ROCm 7
 
         # Log detailed ROCm 7.0 info
         props = torch.cuda.get_device_properties(rank)

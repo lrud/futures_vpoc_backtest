@@ -60,16 +60,29 @@ def get_gpu_metrics(device_ids=None):
 
     for i in valid_device_ids:
         try:
+            # Get memory stats (these should work without amdsmi)
             mem = torch.cuda.memory_stats(i)
-            utilization = torch.cuda.utilization(i)
+            used_memory = mem['allocated_bytes.all.current'] / 1024**2
+            total_memory = torch.cuda.get_device_properties(i).total_memory / 1024**2
+
+            # Try to get utilization, but handle amdsmi import errors gracefully
+            try:
+                utilization = torch.cuda.utilization(i)
+            except (RuntimeError, ImportError) as e:
+                if "amdsmi" in str(e).lower() or "import" in str(e).lower():
+                    # amdsmi is not available, use memory-based utilization estimate
+                    memory_utilization = (used_memory / total_memory * 100) if total_memory > 0 else 0
+                    utilization = min(memory_utilization, 95)  # Cap at 95% for safety
+                    logger.debug(f"GPU {i}: Using memory-based utilization ({utilization:.1f}%) due to amdsmi unavailability")
+                else:
+                    # Other GPU access error
+                    raise e
+
             metrics[i] = {
-                'memory': (
-                    mem['allocated_bytes.all.current'] / 1024**2,
-                    torch.cuda.get_device_properties(i).total_memory / 1024**2
-                ),
+                'memory': (used_memory, total_memory),
                 'utilization': utilization
             }
-        except (RuntimeError, IndexError) as e:
+        except (RuntimeError, IndexError, ImportError) as e:
             # Handle cases where GPU is not visible or accessible
             if "device" in str(e).lower() and ("not visible" in str(e).lower() or "out of range" in str(e).lower()):
                 metrics[i] = {
@@ -169,7 +182,7 @@ def setup_rocm_environment():
     logger.info(f"ROCm environment optimized for {gpu_count} 7900 XT GPUs")
     return True
 
-def prepare_data(args, contract_filter=None, data_path=None, device_ids=None, data_fraction=1.0):
+def prepare_data(args, contract_filter=None, data_path=None, device_ids=None, data_fraction=1.0, chunk_size=3500):
     """
     Load and prepare data for training using FeatureEngineer.
 
@@ -185,13 +198,15 @@ def prepare_data(args, contract_filter=None, data_path=None, device_ids=None, da
         List of GPU device IDs for distributed data loading
     data_fraction: float
         Fraction of data to use (0.1 = 10%, 1.0 = 100%)
-        
+    chunk_size: int
+        VPOC chunk size for processing large sessions (default: 3500)
+
     Returns:
     --------
     tuple or None
         (X_train, y_train, X_val, y_val, feature_columns) or None if failed
     """
-    feature_engineer = FeatureEngineer(device_ids=device_ids)
+    feature_engineer = FeatureEngineer(device_ids=device_ids, chunk_size=chunk_size)
     try:
         # Use explicit data_path if provided, otherwise try args.data_path, fall back to settings.DATA_DIR
         path = data_path if data_path else (
@@ -201,7 +216,8 @@ def prepare_data(args, contract_filter=None, data_path=None, device_ids=None, da
             data_path=path,
             contract_filter=contract_filter,
             device_ids=device_ids,
-            data_fraction=data_fraction
+            data_fraction=data_fraction,
+            chunk_size=chunk_size
         )
     except Exception as e:
         logger.error(f"Data preparation failed: {e}")

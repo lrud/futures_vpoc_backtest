@@ -44,14 +44,23 @@ class AMDOptimizedFuturesModel(nn.Module):
 # Activate the environment
 source futures-vpoc-env/bin/activate
 
-# Set GPU environment variables
+# Set GPU environment variables for ROCm 7 optimization
 export HIP_VISIBLE_DEVICES=0,1
 export PYTORCH_ROCM_ARCH=gfx1100
 export GPU_MAX_HW_QUEUES=8
 
-# Enable memory optimizations
+# Enable memory optimizations (required for current VRAM bug)
 export PYTORCH_HIP_ALLOC_CONF='expandable_segments:True,max_split_size_mb:128'
 ```
+
+### 2. Known VRAM Issue
+
+**⚠️ Current Bug**: The system exhibits a VRAM reporting issue where:
+- `rocm-smi` shows 99% VRAM usage
+- PyTorch reports minimal actual allocation (often < 2MB)
+- Training fails with OOM errors despite showing "free" memory
+
+**Workaround**: Use smaller batch sizes (8-16) and the memory allocation settings above. This appears to be a ROCm 7 memory fragmentation issue.
 
 ### 2. Data Preparation
 
@@ -174,6 +183,26 @@ TRAINING_CONFIG = {
 
 ## Training Execution
 
+### Quick Start Training Command
+
+```bash
+# Environment setup
+export PYTHONPATH=/workspace
+export HIP_VISIBLE_DEVICES=0,1
+export PYTORCH_ROCM_ARCH=gfx1100
+export PYTORCH_HIP_ALLOC_CONF='expandable_segments:True,max_split_size_mb:128'
+
+# Train with merged ES/VIX data (recommended working command)
+python src/ml/train.py \
+    --data DATA/MERGED/merged_es_vix_test.csv \
+    --output TRAINING/ \
+    --epochs 30 \
+    --batch_size 16 \
+    --learning_rate 0.0002 \
+    --hidden_layers 192,128,64 \
+    --use_mixed_precision
+```
+
 ### 1. Single GPU Training
 
 ```python
@@ -206,7 +235,7 @@ def train_single_gpu():
 
     train_loader = DataLoader(
         train_dataset,
-        batch_size=64,
+        batch_size=16,  # Reduced due to VRAM bug
         shuffle=True,
         num_workers=8,
         pin_memory=True

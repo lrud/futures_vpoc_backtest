@@ -113,6 +113,9 @@ class AMDOptimizedFuturesModel(nn.Module):
                     for layer in self.hidden_layers:
                         if isinstance(layer[0], nn.Linear):
                             # Flash Attention optimized path
+                            # Ensure input tensor is on the same device as layer parameters
+                            if hasattr(layer[0], 'weight') and x.device != layer[0].weight.device:
+                                x = x.to(layer[0].weight.device)
                             q = k = v = layer[0](x)
                             x = F.scaled_dot_product_attention(
                                 q, k, v,
@@ -120,6 +123,9 @@ class AMDOptimizedFuturesModel(nn.Module):
                             )
                             x = layer[1:](x)
                         else:
+                            # Ensure input tensor is on the same device as layer parameters
+                            if hasattr(layer, '0') and hasattr(layer[0], 'weight') and x.device != layer[0].weight.device:
+                                x = x.to(layer[0].weight.device)
                             x = layer(x)
                             
                     x = self.final_norm(x)
@@ -127,20 +133,36 @@ class AMDOptimizedFuturesModel(nn.Module):
             else:
                 # Standard forward pass with ROCm optimizations and mixed precision
                 with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+                    # Ensure input tensor is on the same device as model parameters
+                    if hasattr(self, 'device') and x.device != self.device:
+                        x = x.to(self.device)
+                    elif hasattr(self.input_layer, 'weight') and x.device != self.input_layer.weight.device:
+                        x = x.to(self.input_layer.weight.device)
+
+                    # ROCm 7: DISABLED torch.jit.fuser("fuser2") due to memory fragmentation bug
+                    # This causes severe VRAM fragmentation in ROCm 7
                     if torch.cuda.get_device_properties(torch.cuda.current_device()).major >= 11:
-                        with torch.jit.fuser("fuser2"):
-                            x = F.silu(self.input_layer(x))
-                            for layer in self.hidden_layers:
-                                x = layer(x)
-                            x = self.final_norm(x)
-                            return self.output_layer(x)
+                        # Standard forward without JIT fuser for ROCm 7 compatibility
+                        x = F.silu(self.input_layer(x))
+                        for layer in self.hidden_layers:
+                            x = layer(x)
+                        x = self.final_norm(x)
+                        output = self.output_layer(x)
+                        # CRITICAL FIX: Ensure output has correct shape for DataParallel
+                        # Shape: (batch_size, 1) -> (batch_size,) to match target
+                        output = output.squeeze(-1)
+                        return output
                     else:
                         # Fallback for non-RDNA3 GPUs
                         x = F.silu(self.input_layer(x))
                         for layer in self.hidden_layers:
                             x = layer(x)
                         x = self.final_norm(x)
-                        return self.output_layer(x)
+                        output = self.output_layer(x)
+                        # CRITICAL FIX: Ensure output has correct shape for DataParallel
+                        # Shape: (batch_size, 1) -> (batch_size,) to match target
+                        output = output.squeeze(-1)
+                        return output
 
     def _forward_with_checkpointing(self, x):
         """Forward pass with ROCm 7 gradient checkpointing for memory optimization."""
@@ -162,9 +184,12 @@ class AMDOptimizedFuturesModel(nn.Module):
 
         # Final layers
         x = checkpoint(create_custom_forward(self.final_norm), x)
-        x = self.output_layer(x)
+        output = self.output_layer(x)
+        # CRITICAL FIX: Ensure output has correct shape for DataParallel
+        # Shape: (batch_size, 1) -> (batch_size,) to match target
+        output = output.squeeze(-1)
 
-        return x
+        return output
 
     def enable_gradient_checkpointing(self):
         """Enable ROCm 7 gradient checkpointing for memory optimization."""

@@ -35,7 +35,7 @@ Advanced algorithmic trading strategy for E-mini S&P 500 (ES) futures that combi
 - **Sharpe Ratio**: 4.52
 - **Max Drawdown**: -3.60%
 
-⚠️ **Technical Difficulties**: Current implementation is experiencing issues with the latest iteration of VPOC calculations, GARCH volatility modeling, and log transformations. The development team is working to resolve these compatibility issues with the updated dependencies.
+⚠️ **Technical Difficulties**: ROCm 7 compatibility issues have broken ML training functionality. The system exhibits severe VRAM fragmentation where rocm-smi shows 99% VRAM usage while PyTorch reports minimal actual allocation. Additionally, PyTorch 2.5+ requires ROCm >= 6.3 for AMD RX 7900 XT compatibility, creating version mismatch issues. Currently debugging multiple approaches including ROCm 6.2 downgrade, PyTorch version rollback, and alternative training frameworks.
 
 ![Strategy Comparison](strategy_comparison.png)
 
@@ -234,23 +234,34 @@ pip install -r requirements.txt
 
 #### Step 1: Train ML Model
 ```bash
-# Basic training (adjust parameters as needed)
-python src/ml/train.py \
-    --hidden_layers 128,64 \
-    --learning_rate 0.0005 \
-    --epochs 50 \
-    --batch_size 32 \
-    --use_mixed_precision \
-    --contract ES
+# Set environment variables for ROCm 7 optimization
+export HIP_VISIBLE_DEVICES=0,1
+export PYTORCH_ROCM_ARCH=gfx1100
+export PYTORCH_HIP_ALLOC_CONF='expandable_segments:True,max_split_size_mb:128'
+
+# Train with merged ES/VIX data (current working command)
+PYTHONPATH=/workspace python src/ml/train.py \
+    --data DATA/MERGED/merged_es_vix_test.csv \
+    --output TRAINING/ \
+    --epochs 30 \
+    --batch_size 16 \
+    --learning_rate 0.0002 \
+    --hidden_layers 192,128,64 \
+    --use_mixed_precision
 
 # For distributed training across multiple GPUs
-python src/ml/train.py \
-    --hidden_layers 256,128,64 \
+PYTHONPATH=/workspace python src/ml/train.py \
+    --data DATA/MERGED/merged_es_vix_test.csv \
+    --output TRAINING/ \
+    --epochs 50 \
+    --batch_size 16 \
     --learning_rate 0.0003 \
-    --epochs 100 \
-    --batch_size 64 \
+    --hidden_layers 128,64 \
+    --use_mixed_precision \
     --device_ids 0,1
 ```
+
+**⚠️ Known Issue**: Current ROCm 7 implementation shows 99% VRAM usage in rocm-smi but fails with OOM during training. This appears to be a memory fragmentation issue. Use smaller batch sizes (8-16) to work around this.
 
 #### Step 2: Run ML-Enhanced Backtest
 ```bash

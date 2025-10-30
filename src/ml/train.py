@@ -8,6 +8,10 @@ import argparse
 import torch
 from datetime import datetime, timedelta
 
+# CRITICAL: Disable hipBLASLt for ROCm 7 + RDNA3 compatibility
+# Prevents HIPBLAS_STATUS_INTERNAL_ERROR on AMD RX 7900 XT
+os.environ['TORCH_BLAS_PREFER_HIPBLASLT'] = '0'
+
 # Import local modules
 from src.ml.model import AMDOptimizedFuturesModel
 from src.ml.trainer import ModelTrainer
@@ -17,6 +21,35 @@ from src.utils.logging import get_logger, setup_logging
 
 # Initialize logger
 logger = get_logger(__name__)
+
+def prime_rocm_allocator(device='cuda:0'):
+    """
+    Pre-allocate and free dummy tensor to 'warm up' ROCm memory allocator.
+    This bizarre workaround fixes fragmentation issues on AMD GPUs.
+    """
+    logger.info("🔧 Priming ROCm memory allocator...")
+
+    try:
+        # Create progressively smaller dummy tensors for severe fragmentation
+        for size_mb in [32, 64, 128]:  # Much smaller sizes
+            elements = int(size_mb * 1024**2 / 4)  # 4 bytes per float32
+
+            # Allocate
+            dummy = torch.randn(elements, device=device, dtype=torch.float32)
+            torch.cuda.synchronize()
+
+            # Free
+            del dummy
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
+
+        allocated = torch.cuda.memory_allocated(device) / 1024**3
+        reserved = torch.cuda.memory_reserved(device) / 1024**3
+        logger.info(f"✅ ROCm allocator primed on {device}")
+        logger.info(f"   Allocated: {allocated:.2f}GB / Reserved: {reserved:.2f}GB")
+    except Exception as e:
+        logger.warning(f"Failed to prime ROCm allocator (continuing): {e}")
+        logger.info("   Skipping allocator priming due to memory constraints")
 
 def parse_arguments():
     """Parse command-line arguments for training."""
@@ -107,6 +140,39 @@ def parse_arguments():
     )
 
     parser.add_argument(
+        "--skip_gpu_cleanup",
+        action="store_true",
+        help="Skip pre-training GPU cleanup (faster startup)"
+    )
+
+    parser.add_argument(
+        "--chunk_size",
+        type=int,
+        default=3500,
+        help="VPOC chunk size for processing large sessions (default: 3500). Larger chunks reduce processing overhead but use more VRAM."
+    )
+
+    parser.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=4,
+        help="Number of steps to accumulate gradients before updating weights (default: 4). Allows larger effective batch sizes with less memory."
+    )
+
+    parser.add_argument(
+        "--resume_from_checkpoint",
+        action="store_true",
+        help="Resume training from last checkpoint if available"
+    )
+
+    parser.add_argument(
+        "--checkpoint_interval",
+        type=int,
+        default=50,
+        help="Save checkpoint every N batches (default: 50)"
+    )
+
+    parser.add_argument(
         "--distributed_strategy",
         type=str,
         choices=['dataparallel', 'fsdp', 'auto'],
@@ -167,8 +233,7 @@ def setup_pytorch210_fsdp(model, device_ids, use_mixed_precision=False):
 
             dist.init_process_group(
                 backend='hccl',  # ROCm backend
-                init_method='env://',
-                timeout=torch.distributed.Timeout(seconds=1800)
+                init_method='env://'
             )
 
         # Mixed precision configuration for PyTorch 2.10
@@ -313,7 +378,8 @@ def main():
                         contract_filter=None if args.contract == "ALL" else args.contract,
                         data_path=data_path,
                         device_ids=device_ids,
-                        data_fraction=args.data_fraction)
+                        data_fraction=args.data_fraction,
+                        chunk_size=args.chunk_size)
     if not result:
         logger.error("Data preparation failed")
         return 1
@@ -336,6 +402,11 @@ def main():
     if device_ids and len(device_ids) > 1:
         model = torch.nn.DataParallel(model, device_ids=device_ids)
     model = model.to(device)
+
+    # CRITICAL: Prime ROCm allocator to prevent fragmentation
+    prime_rocm_allocator('cuda:0')
+    if torch.cuda.device_count() > 1:
+        prime_rocm_allocator('cuda:1')
     
     # Store feature column names and model metadata
     if not hasattr(model, 'feature_columns'):
@@ -365,24 +436,33 @@ def main():
         device_ids = [0, 1]
         logger.info(f"Multi-GPU training detected with {len(device_ids)} GPUs")
 
-        # ROCm 7 optimizations for multi-GPU
+        # ROCm 7 optimizations for multi-GPU with memory management
         os.environ.update({
             'PYTORCH_ROCM_ARCH': 'gfx1100',
             'PYTORCH_ROCM_WAVE32_MODE': '1',
             'PYTORCH_ROCM_FUSION': '1',
-            'PYTORCH_HIP_ALLOC_CONF': 'expandable_segments:True,max_split_size_mb:256',
-            'GPU_SINGLE_ALLOC_PERCENT': '90',
+            'PYTORCH_HIP_ALLOC_CONF': 'expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.6',
+            'GPU_SINGLE_ALLOC_PERCENT': '80',  # Reduced from 90
             'HSA_ENABLE_SDMA': '0',
             'HSA_ENABLE_INTERRUPT': '0',
             'HSA_ENABLE_WAIT_COMPLETION': '0',
             'GPU_MAX_HW_QUEUES': '8',
-            'ENABLE_FLASH_ATTENTION': '1',
+            'ENABLE_FLASH_ATTENTION': '0',  # Disabled for ROCm 7 compatibility
             'TORCH_COMPILE_BACKEND': 'inductor'
         })
 
         # Make both GPUs visible
         os.environ['HIP_VISIBLE_DEVICES'] = '0,1'
         os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
+
+        # Pre-emptive memory cleanup for DataParallel
+        if torch.cuda.is_available() and not args.skip_gpu_cleanup:
+            logger.info("🧹 Performing pre-training GPU cleanup...")
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+        elif torch.cuda.is_available() and args.skip_gpu_cleanup:
+            logger.info("⚡ Skipping pre-training GPU cleanup for faster startup")
 
         # Choose distributed strategy based on argument
         strategy = args.distributed_strategy
@@ -393,26 +473,33 @@ def main():
         logger.info(f"🎯 Using distributed strategy: {strategy}")
 
         if strategy == 'fsdp':
-            # Try PyTorch 2.10 FSDP first
-            fsdp_model = setup_pytorch210_fsdp(model, device_ids, args.use_mixed_precision)
-            if fsdp_model is not None:
-                model = fsdp_model
-                logger.info("✅ PyTorch 2.10 FSDP (Fully Sharded Data Parallel) enabled")
-            else:
-                # Fall back to DataParallel
-                strategy = 'dataparallel'
-                logger.info("⚠️ FSDP failed, falling back to DataParallel")
+            # DISABLED: FSDP due to ROCm version incompatibility
+            # FSDP can hang with certain ROCm/PyTorch version combinations
+            logger.warning(f"⚠️  FSDP DISABLED due to ROCm version incompatibility")
+            logger.warning(f"   • PyTorch: {torch.__version__}")
+            if hasattr(torch.version, 'hip'):
+                logger.warning(f"   • ROCm/HIP: {torch.version.hip}")
+            logger.warning(f"   • FSDP hangs at hccl backend initialization")
+            logger.warning(f"   • Using DataParallel fallback for stability")
+            strategy = 'dataparallel'
+            logger.info("🔄 Forced DataParallel fallback due to FSDP incompatibility")
 
         if strategy == 'dataparallel':
-            # Use traditional DataParallel
+            # Use traditional DataParallel with memory management
+            logger.info(f"🚀 Creating DataParallel model with GPUs: {device_ids}")
+
+            # Clear memory before DataParallel wrapping
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+
             model = torch.nn.DataParallel(model, device_ids=device_ids, output_device=device_ids[0])
 
-            # Enable Flash Attention
+            # Disable Flash Attention for ROCm 7 compatibility
             if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
                 model.module.enable_flash_attention = False
                 logger.info("Flash Attention disabled for ROCm 7 compatibility (DataParallel)")
 
-            logger.info(f"🚀 DataParallel model created with GPUs: {device_ids}")
+            logger.info(f"✅ DataParallel model created with memory-safe configuration")
 
         # Log GPU information
         for i in device_ids:
@@ -433,6 +520,9 @@ def main():
                 'use_mixed_precision': args.use_mixed_precision,
                 'output_dir': args.output_dir,
                 'device': device,
+                'gradient_accumulation_steps': args.gradient_accumulation_steps,
+                'resume_from_checkpoint': args.resume_from_checkpoint,
+                'checkpoint_interval': args.checkpoint_interval,
             }
         )
     else:
@@ -446,6 +536,9 @@ def main():
                 'use_mixed_precision': args.use_mixed_precision,
                 'output_dir': args.output_dir,
                 'device': device,
+                'gradient_accumulation_steps': args.gradient_accumulation_steps,
+                'resume_from_checkpoint': args.resume_from_checkpoint,
+                'checkpoint_interval': args.checkpoint_interval,
             }
         )
     
@@ -453,14 +546,38 @@ def main():
     plot_path = os.path.join(args.output_dir, "training_history.png")
     trainer.plot_training_history(history, save_path=plot_path)
     
-    # Save the trained model
+    # Save the trained model with memory cleanup
     model_path = os.path.join(args.output_dir, "model.pt")
 
-    # For DataParallel models, save the underlying model
+    # For DataParallel models, save the underlying model and cleanup
     if hasattr(trained_model, 'module'):
         # Get the underlying model from DataParallel wrapper
         final_model = trained_model.module
         logger.info("Extracted model from DataParallel wrapper")
+
+        # ROCm 7: DataParallel cleanup
+        logger.info("🧹 Performing DataParallel cleanup...")
+
+        # Move DataParallel model to CPU to free GPU memory
+        trained_model.cpu()
+
+        # Clear gradients from all parameters
+        for param in trained_model.parameters():
+            if param.grad is not None:
+                param.grad = None
+
+        # Delete the DataParallel wrapper
+        del trained_model
+
+        # Force garbage collection and GPU cleanup
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+
+        logger.info("✅ DataParallel cleanup completed")
     else:
         final_model = trained_model
 
