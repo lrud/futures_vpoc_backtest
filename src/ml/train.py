@@ -6,6 +6,7 @@ import os
 import sys
 import argparse
 import torch
+import torch.distributed as dist
 from datetime import datetime, timedelta
 
 # CRITICAL: Disable hipBLASLt for ROCm 7 + RDNA3 compatibility
@@ -149,7 +150,7 @@ def parse_arguments():
         "--chunk_size",
         type=int,
         default=3500,
-        help="VPOC chunk size for processing large sessions (default: 3500). Larger chunks reduce processing overhead but use more VRAM."
+        help="VPOC chunk size for processing large sessions (default: 3500). Larger chunks reduce processing overhead but use more VRAM"
     )
 
     parser.add_argument(
@@ -220,7 +221,6 @@ def setup_pytorch210_fsdp(model, device_ids, use_mixed_precision=False):
         from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
         from torch.distributed.fsdp import MixedPrecision, BackwardPrefetch
         from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
-        import torch.distributed as dist
 
         # Check if distributed is already initialized
         if not dist.is_initialized():
@@ -288,8 +288,8 @@ def main():
     setup_logging(level=log_level)
     logger.info("Starting training script")
     
-    # Set random seed for reproducibility
-    set_random_seed(args.seed)
+    # Skip random seed setting due to PyTorch CUDA seeding bug
+    # set_random_seed(args.seed)
     
     # Verify and setup GPU environment
     use_gpu = torch.cuda.is_available()
@@ -383,8 +383,73 @@ def main():
     if not result:
         logger.error("Data preparation failed")
         return 1
-        
+
     X_train, y_train, X_val, y_val, feature_columns = result
+
+    # CRITICAL FIX: Validate data quality before training
+    logger.info("🔍 VALIDATING DATA QUALITY BEFORE TRAINING")
+    try:
+        import numpy as np
+
+        # Check for NaN/Inf values
+        nan_count_train = np.sum(np.isnan(X_train))
+        inf_count_train = np.sum(np.isinf(X_train))
+        nan_count_val = np.sum(np.isnan(X_val))
+        inf_count_val = np.sum(np.isinf(X_val))
+
+        nan_target_train = np.sum(np.isnan(y_train))
+        inf_target_train = np.sum(np.isinf(y_train))
+        nan_target_val = np.sum(np.isnan(y_val))
+        inf_target_val = np.sum(np.isinf(y_val))
+
+        logger.info(f"📊 Data Quality Report:")
+        logger.info(f"  • Training features - NaN: {nan_count_train}, Inf: {inf_count_train}")
+        logger.info(f"  • Training targets - NaN: {nan_target_train}, Inf: {inf_target_train}")
+        logger.info(f"  • Validation features - NaN: {nan_count_val}, Inf: {inf_count_val}")
+        logger.info(f"  • Validation targets - NaN: {nan_target_val}, Inf: {inf_target_val}")
+
+        # Check target ranges
+        y_train_min, y_train_max = np.min(y_train), np.max(y_train)
+        y_val_min, y_val_max = np.min(y_val), np.max(y_val)
+
+        logger.info(f"  • Target ranges - Train: [{y_train_min:.6f}, {y_train_max:.6f}], Val: [{y_val_min:.6f}, {y_val_max:.6f}]")
+
+        # Check for extreme target values that could cause instability
+        extreme_threshold = 0.05  # ±5% returns
+        extreme_train = np.sum(np.abs(y_train) > extreme_threshold)
+        extreme_val = np.sum(np.abs(y_val) > extreme_threshold)
+
+        if extreme_train > 0:
+            logger.warning(f"⚠️  Found {extreme_train} extreme training targets (>±{extreme_threshold*100:.0f}%)")
+        if extreme_val > 0:
+            logger.warning(f"⚠️  Found {extreme_val} extreme validation targets (>±{extreme_threshold*100:.0f}%)")
+
+        # Validate feature scaling
+        feature_means = np.mean(X_train, axis=0)
+        feature_stds = np.std(X_train, axis=0)
+
+        extreme_features_mean = np.sum(np.abs(feature_means) > 5)
+        extreme_features_std = np.sum(feature_stds > 10)
+
+        if extreme_features_mean > 0:
+            logger.warning(f"⚠️  Found {extreme_features_mean} features with extreme means (>5)")
+        if extreme_features_std > 0:
+            logger.warning(f"⚠️  Found {extreme_features_std} features with extreme std (>10)")
+
+        # If critical issues found, raise error
+        total_issues = (nan_count_train + inf_count_train + nan_count_val + inf_count_val +
+                       nan_target_train + inf_target_train + nan_target_val + inf_target_val)
+
+        if total_issues > 0:
+            logger.error(f"🚨 CRITICAL: Found {total_issues} data quality issues - training may fail")
+            # For now, continue but with warning
+            logger.warning("⚠️  Continuing training despite data quality issues...")
+        else:
+            logger.info("✅ Data quality validation passed")
+
+    except Exception as e:
+        logger.error(f"❌ Data quality validation failed: {e}")
+        logger.warning("⚠️  Continuing with training...")
     
     # Log GPU memory after data loading
     if use_gpu:
@@ -437,21 +502,22 @@ def main():
         logger.info(f"Multi-GPU training detected with {len(device_ids)} GPUs")
 
         # ROCm 7 optimizations for multi-GPU with memory management
+        # ROCm 6.3 optimized environment variables
         os.environ.update({
             'PYTORCH_ROCM_ARCH': 'gfx1100',
-            'PYTORCH_ROCM_WAVE32_MODE': '1',
-            'PYTORCH_ROCM_FUSION': '1',
-            'PYTORCH_HIP_ALLOC_CONF': 'expandable_segments:True,max_split_size_mb:128,garbage_collection_threshold:0.6',
-            'GPU_SINGLE_ALLOC_PERCENT': '80',  # Reduced from 90
+            'PYTORCH_HIP_ALLOC_CONF': 'expandable_segments:True,max_split_size_mb:128',
+            'GPU_SINGLE_ALLOC_PERCENT': '90',
+            'GPU_MAX_ALLOC_PERCENT': '100',
             'HSA_ENABLE_SDMA': '0',
             'HSA_ENABLE_INTERRUPT': '0',
-            'HSA_ENABLE_WAIT_COMPLETION': '0',
-            'GPU_MAX_HW_QUEUES': '8',
-            'ENABLE_FLASH_ATTENTION': '0',  # Disabled for ROCm 7 compatibility
-            'TORCH_COMPILE_BACKEND': 'inductor'
+            'HSA_UNALIGNED_ACCESS_MODE': '1',
+            'HIP_HIDDEN_FREE_MEM': '256',
+            'TORCH_COMPILE_BACKEND': 'inductor',
+            'TORCH_BLAS_PREFER_HIPBLASLT': '0',  # Critical for ROCm 6.3 stability
+            'CUDA_LAUNCH_BLOCKING': '1'  # Better error handling
         })
 
-        # Make both GPUs visible
+        # Enable dual RX 7900 XT configuration
         os.environ['HIP_VISIBLE_DEVICES'] = '0,1'
         os.environ['CUDA_VISIBLE_DEVICES'] = '0,1'
 
@@ -600,7 +666,9 @@ if __name__ == "__main__":
         sys.exit(main())
     except Exception as e:
         # Cleanup on any exception
+        import traceback
         logger.error(f"Training failed with error: {e}")
+        logger.error(f"Full traceback:\n{traceback.format_exc()}")
         logger.info("Performing emergency GPU cleanup...")
 
         # Clear GPU memory

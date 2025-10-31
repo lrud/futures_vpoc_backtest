@@ -9,47 +9,57 @@ from src.config.settings import settings
 logger = get_logger(__name__)
 
 class VolumeProfileAnalyzer:
-    """Handles volume profile analysis, VPOC, and value area calculations with ROCm 7 multi-GPU optimization."""
+    """Handles volume profile analysis, VPOC, and value area calculations with ROCm 6.3 compatible multi-GPU optimization."""
 
     def __init__(self, price_precision=None, device='cuda', device_ids=None, chunk_size=3500):
         self.logger = get_logger(__name__)
         self.price_precision = price_precision or settings.PRICE_PRECISION
         self.chunk_size = chunk_size
 
-        # ROCm 7 optimizations
-        os.environ['HIP_VISIBLE_DEVICES'] = ','.join(map(str, device_ids or [0]))
+        # ROCm 6.3 compatible optimizations for dual RX 7900 XT
+        os.environ['HIP_VISIBLE_DEVICES'] = '0,1'
         os.environ['HSA_ENABLE_SDMA'] = '0'
         os.environ['HSA_ENABLE_INTERRUPT'] = '0'
-        os.environ['PYTORCH_ROCM_WAVE32_MODE'] = '1'
 
-        # Handle multi-GPU setup
+        # Handle dual RX 7900 XT setup
         if torch.cuda.is_available():
-            if device_ids and len(device_ids) > 1:
-                self.device_ids = device_ids
-                self.parallel = True
-                self.device = 'cuda'  # Use default CUDA device for distributed computing
-                self.num_gpus = len(device_ids)
+            gpu_count = torch.cuda.device_count()
+            self.logger.info(f"Detected {gpu_count} RX 7900 XT GPUs")
 
-                # Initialize distributed processing for VPOC
-                self._setup_distributed_vpoc()
+            if gpu_count >= 2 and device_ids and len(device_ids) >= 2:
+                # Dual GPU configuration
+                self.device_ids = device_ids[:2]  # Use first two GPUs
+                self.parallel = True
+                self.device = 'cuda'
+                self.num_gpus = 2
+                self.logger.info(f"🚀 Dual RX 7900 XT configuration: GPUs {self.device_ids}")
+
+                # Verify both GPUs are accessible
+                for gpu_id in self.device_ids:
+                    try:
+                        torch.cuda.device(gpu_id)
+                        props = torch.cuda.get_device_properties(gpu_id)
+                        self.logger.info(f"✅ GPU {gpu_id}: {props.name} ({props.total_memory/1e9:.1f}GB)")
+                    except Exception as e:
+                        self.logger.error(f"❌ GPU {gpu_id} not accessible: {e}")
+                        raise RuntimeError(f"GPU {gpu_id} not accessible")
             else:
+                # Single GPU fallback
                 self.device = device
                 self.parallel = False
                 self.num_gpus = 1
                 self.device_ids = [0]
+                self.logger.info("🔧 Single GPU configuration")
         else:
-            self.device = 'cpu'
-            self.parallel = False
-            self.num_gpus = 1
-            self.device_ids = []
+            raise RuntimeError("CUDA is not available - GPU access required")
 
-        self.logger.info(f"🚀 Initialized ROCm 7 VolumeProfileAnalyzer with precision {self.price_precision} on {self.num_gpus} GPU(s): {self.device_ids}")
+        self.logger.info(f"🚀 Initialized ROCm 6.3 compatible VolumeProfileAnalyzer with precision {self.price_precision} on {self.num_gpus} GPU(s): {self.device_ids}")
 
     def _setup_distributed_vpoc(self):
         """Setup distributed processing for VPOC calculations."""
         try:
             # Use ROCm's optimized scatter gather operations
-            self.logger.info("Setting up ROCm 7 distributed VPOC processing")
+            self.logger.info("Setting up ROCm 6.3 compatible distributed VPOC processing")
 
             # Removed pre-allocation that was causing memory leaks
             # Memory will be allocated dynamically as needed
@@ -82,8 +92,8 @@ class VolumeProfileAnalyzer:
 
         except Exception as e:
             self.logger.error(f"GPU volume profile calculation failed: {str(e)}")
-            self.logger.info("Falling back to CPU implementation")
-            return self._calculate_volume_profile_cpu(session_df)
+            self.logger.error("GPU processing is required - no CPU fallback available")
+            raise RuntimeError(f"VPOC GPU processing failed: {str(e)}")
 
     def _calculate_volume_profile_distributed(self, session_df):
         """Distributed VPOC calculation across multiple GPUs with ROCm 7 optimization."""
@@ -478,11 +488,9 @@ class VolumeProfileAnalyzer:
                 self.logger.debug(f"ROCm 7: Completed chunk {chunk_idx + 1}/{num_chunks}, memory cleaned up")
 
             except Exception as e:
-                self.logger.error(f"ROCm 7: Failed to process chunk {chunk_idx + 1}: {e}")
-                # Fall back to CPU for this chunk
-                self.logger.info(f"ROCm 7: Falling back to CPU for chunk {chunk_idx + 1}")
-                chunk_profile_df = self._calculate_volume_profile_cpu(chunk_df)
-                all_volume_profiles.append(chunk_profile_df)
+                self.logger.error(f"Failed to process chunk {chunk_idx + 1}: {e}")
+                # No CPU fallback - GPU processing is required
+                raise RuntimeError(f"Chunk {chunk_idx + 1} GPU processing failed: {e}")
 
         # Combine all chunk results
         self.logger.info("ROCm 7: Combining volume profiles from all chunks")

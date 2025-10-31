@@ -18,23 +18,22 @@ from src.utils.logging import get_logger
 logger = get_logger(__name__)
 
 def _setup_process_group(rank, world_size):
-    """Initialize process group for distributed training with ROCm 7.0 optimizations."""
+    """Initialize process group for distributed training with ROCm 6.3 compatible optimizations."""
     try:
-        # ROCm 7.0 optimized distributed training config
+        # ROCm 6.3 compatible distributed training config
         os.environ['MASTER_ADDR'] = '127.0.0.1'  # Use IP instead of localhost
         os.environ['MASTER_PORT'] = '12355'
         os.environ['WORLD_SIZE'] = str(world_size)
         os.environ['RANK'] = str(rank)
 
-        # ROCm 7.0 specific optimizations for dual 7900 XT setup
+        # ROCm 6.3 compatible optimizations for dual 7900 XT setup
         os.environ.update({
-            # ROCm 7.0 HCCL (HIP Collective Communications Library) settings
+            # Basic HCCL settings (ROCm 6.x compatible)
             'ROCM_HCCL_DEBUG': 'WARN',        # Reduced debugging for performance
             'HIP_VISIBLE_DEVICES': str(rank), # Each process sees only its GPU
             'HSA_ENABLE_SDMA': '0',           # Disable for better GPU utilization
-            'GPU_MAX_HW_QUEUES': '8',         # Optimize for 7900 XT
 
-            # ROCm 7.0 PyTorch specific settings
+            # ROCm 6.3 PyTorch specific settings (removed ROCm 7 variables)
             'PYTORCH_ROCM_ARCH': 'gfx1100',   # RDNA3 architecture for 7900 XT
             'PYTORCH_HIP_ALLOC_CONF': 'expandable_segments:True,max_split_size_mb:128',
             'HIP_LAUNCH_BLOCKING': '0',       # Async kernel launches
@@ -44,23 +43,21 @@ def _setup_process_group(rank, world_size):
             'HSA_ENABLE_INTERRUPT': '0',
             'HSA_ENABLE_WAIT_COMPLETION': '0',
 
-            # PyTorch 2.10+ ROCm optimizations
+            # PyTorch torch.compile optimizations (ROCm 6.x compatible)
             'TORCH_COMPILE_BACKEND': 'inductor',
-            'TORCHINDUCTOR_FUSION_GROUP_MAX_SIZE': '16',
 
-            # Flash Attention and kernel fusion
-            'PYTORCH_ROCM_FUSION': '1',
-            'ENABLE_FLASH_ATTENTION': '1',
+            # ROCm 6.x compatible settings (removed ROCm 7 specific variables)
+            # Note: PYTORCH_ROCM_FUSION and ENABLE_FLASH_ATTENTION removed for ROCm 6.x compatibility
 
-            # NCCL settings for ROCm
+            # NCCL settings for ROCm 6.x
             'NCCL_DEBUG': 'WARN',
             'NCCL_SOCKET_IFNAME': 'lo',
             'NCCL_NSOCKS_PERTHREAD': '4'
         })
 
-        logger.info(f"🚀 Initializing ROCm 7.0 process group for rank {rank}/{world_size}")
+        logger.info(f"🚀 Initializing ROCm 6.3 compatible process group for rank {rank}/{world_size}")
 
-        # Initialize process group with ROCm 7.0 optimized settings
+        # Initialize process group with ROCm 6.x compatible settings
         # Use 'gloo' backend which is more stable than nccl for ROCm
         dist.init_process_group(
             backend="gloo",  # Changed from nccl to gloo for better ROCm compatibility
@@ -70,23 +67,23 @@ def _setup_process_group(rank, world_size):
             timeout=datetime.timedelta(minutes=5)  # Reduced timeout
         )
 
-        # Configure GPU with ROCm 7.0 optimizations
+        # Configure GPU with ROCm 6.x compatible settings
         torch.cuda.set_device(rank)
 
-        # ROCm 7: DISABLED Flash Attention settings due to memory fragmentation
-        # These cause severe VRAM fragmentation in ROCm 7
+        # ROCm 6.x: Enable standard Flash Attention (works properly in ROCm 6.x)
+        # No need to disable in ROCm 6.x like we did for ROCm 7
         if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
-            torch.backends.cuda.enable_flash_sdp(False)  # Disabled for ROCm 7
-            torch.backends.cuda.enable_mem_efficient_sdp(False)  # Disabled for ROCm 7
-            torch.backends.cuda.enable_math_sdp(False)  # Disabled for ROCm 7
+            # Use default Flash Attention settings for ROCm 6.x
+            pass
 
-        # ROCm 7: DISABLED JIT optimizations due to memory fragmentation
-        # torch._C._jit_set_profiling_executor(False)  # Disabled for ROCm 7
-        # torch._C._jit_set_profiling_mode(False)      # Disabled for ROCm 7
+        # ROCm 6.x: Standard JIT optimizations (no memory fragmentation issues like ROCm 7)
+        # ROCm 6.x: JIT optimizations available if needed
+        # torch._C._jit_set_profiling_executor(False)  # Available if needed
+        # torch._C._jit_set_profiling_mode(False)      # Available if needed
 
-        # Log detailed ROCm 7.0 info
+        # Log detailed ROCm 6.x compatible info
         props = torch.cuda.get_device_properties(rank)
-        logger.info(f"✅ Initialized ROCm 7.0 process group (gloo) for rank {rank}")
+        logger.info(f"✅ Initialized ROCm 6.3 compatible process group (gloo) for rank {rank}")
         logger.info(f"🎯 GPU {rank} Info: {props.name}")
         logger.info(f"🔧 Compute: {props.multi_processor_count} compute units")
         logger.info(f"💾 Memory: {props.total_memory/1e9:.2f}GB total")
@@ -94,7 +91,7 @@ def _setup_process_group(rank, world_size):
         # Log GPU memory status
         free_mem, total_mem = torch.cuda.mem_get_info(rank)
         logger.info(f"💾 Available Memory: {free_mem/1e9:.2f}GB / {total_mem/1e9:.2f}GB")
-        logger.info(f"⚡ ROCm 7.0 Optimizations: Flash Attention, BF16, Gloo enabled")
+        logger.info(f"⚡ ROCm 6.3 Optimizations: Standard Flash Attention, BF16, Gloo enabled")
 
         return True
 
@@ -108,15 +105,15 @@ def _cleanup_process_group():
         dist.destroy_process_group()
 
 def _train_worker(rank, world_size, model, X_train, y_train, X_val, y_val, args_dict, feature_columns):
-    """Worker function for distributed training with ROCm 7.0 optimizations."""
+    """Worker function for distributed training with ROCm 6.3 compatible optimizations."""
     logger.info(f"🚀 Starting distributed worker {rank}/{world_size}")
 
-    # Initialize process group with enhanced ROCm 7.0 settings
+    # Initialize process group with ROCm 6.3 compatible settings
     if not _setup_process_group(rank, world_size):
         logger.error(f"❌ Failed to initialize process group for rank {rank}")
         return None, {}
 
-    # Enable Flash Attention if available
+    # Enable Flash Attention if available (works properly in ROCm 6.x)
     if hasattr(torch.nn.functional, 'scaled_dot_product_attention'):
         model.enable_flash_attention = True
         logger.info(f"✅ Rank {rank}: Flash Attention enabled for time series modeling")
@@ -124,9 +121,9 @@ def _train_worker(rank, world_size, model, X_train, y_train, X_val, y_val, args_
     # Force model to use specific GPU
     torch.cuda.set_device(rank)
     logger.info(f"🎯 Rank {rank}: Assigned to GPU {rank} - {torch.cuda.get_device_name(rank)}")
-    
+
     try:
-        # Create device with ROCm optimizations
+        # Create device with ROCm 6.x compatible optimizations
         device = torch.cuda.current_device()
         
         # Log detailed device info

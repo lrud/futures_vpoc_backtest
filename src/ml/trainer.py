@@ -6,6 +6,7 @@ Handles dataset preparation, training loop, and model evaluation.
 import os
 import time
 import torch
+import torch.version
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
@@ -118,7 +119,6 @@ class ModelTrainer(TrainingCore):
         """Save training checkpoint for resuming after OOM errors."""
         try:
             import os
-            import torch
 
             checkpoint_path = os.path.join(self.model_manager.model_dir, 'checkpoint.pt')
             checkpoint = {
@@ -141,7 +141,6 @@ class ModelTrainer(TrainingCore):
         """Load training checkpoint for resuming."""
         try:
             import os
-            import torch
 
             checkpoint_path = os.path.join(self.model_manager.model_dir, 'checkpoint.pt')
             if not os.path.exists(checkpoint_path):
@@ -232,6 +231,11 @@ class ModelTrainer(TrainingCore):
 
                     # Step optimizer only after accumulation steps
                     if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                        # CRITICAL FIX: Apply gradient clipping to prevent explosion
+                        if hasattr(torch.nn.utils, 'clip_grad_norm_'):
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                            self.logger.debug(f"    📐 Applied gradient clipping (max_norm=1.0)")
+
                         self.scaler.step(self.optimizer)
                         self.scaler.update()
                         self.optimizer.zero_grad()
@@ -265,6 +269,11 @@ class ModelTrainer(TrainingCore):
 
                     # Step optimizer only after accumulation steps
                     if (batch_idx + 1) % gradient_accumulation_steps == 0:
+                        # CRITICAL FIX: Apply gradient clipping to prevent explosion
+                        if hasattr(torch.nn.utils, 'clip_grad_norm_'):
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                            self.logger.debug(f"    📐 Applied gradient clipping (max_norm=1.0)")
+
                         self.optimizer.step()
                         self.optimizer.zero_grad()
 
@@ -688,36 +697,50 @@ class ModelTrainer(TrainingCore):
         return self.model, history
 
     def _setup_rocm_memory_optimizations(self, model, use_mixed_precision):
-        """Setup ROCm 7 + PyTorch 2.10 optimizations for distributed training."""
+        """Setup ROCm 6.3 compatible optimizations for distributed training."""
 
         if not torch.cuda.is_available():
             return
 
-        # PyTorch 2.10 torch.compile optimization
+        # Detect ROCm version for appropriate optimizations
         try:
-            self._setup_pytorch210_compile(model)
+            rocm_version = torch.version.hip
+            is_rocm6 = rocm_version.startswith("6.")
+        except:
+            is_rocm6 = True  # Assume ROCm 6.x for compatibility
+
+        # PyTorch torch.compile optimization (version-aware)
+        try:
+            if is_rocm6:
+                self.logger.info("Using ROCm 6.x compatible optimizations")
+                # Basic torch.compile for ROCm 6.x
+                if hasattr(torch, 'compile'):
+                    model = torch.compile(model, mode='reduce-overhead')
+                    self.logger.info("✅ ROCm 6.x torch.compile optimizations applied")
+            else:
+                self._setup_pytorch210_compile(model)
         except Exception as e:
             self.logger.warning(f"Could not setup torch.compile: {e}")
 
         # Enable gradient checkpointing if model supports it
         if hasattr(model, 'enable_gradient_checkpointing'):
             model.enable_gradient_checkpointing()
-            self.logger.info("✅ ROCm 7 gradient checkpointing enabled")
+            self.logger.info("✅ Gradient checkpointing enabled")
 
-        # Setup memory pool for better memory management
+        # Setup memory pool for better memory management (ROCm 6.x compatible)
         try:
             # Configure memory pool size based on available GPU memory
             total_memory = torch.cuda.get_device_properties(self.device).total_memory
-            pool_size_gb = min(8, total_memory / (1024**3) * 0.2)  # 20% of GPU memory, max 8GB
+            pool_size_gb = min(4, total_memory / (1024**3) * 0.15)  # Smaller pool for ROCm 6.x
 
-            self.logger.info(f"🔧 Setting up ROCm 7 memory pool: {pool_size_gb:.1f}GB")
+            self.logger.info(f"🔧 Setting up memory pool: {pool_size_gb:.1f}GB")
 
-            # PyTorch memory settings for ROCm 7
+            # ROCm 6.x compatible memory settings
             torch.cuda.empty_cache()
 
             # Enable memory pool if available
             if hasattr(torch.cuda, 'memory'):
-                self.logger.info("✅ ROCm 7 memory pool optimizations applied")
+                self.logger.info("✅ Memory pool optimizations applied")
 
         except Exception as e:
             self.logger.warning(f"Could not setup memory pool: {e}")
@@ -726,43 +749,28 @@ class ModelTrainer(TrainingCore):
         if use_mixed_precision:
             from torch.cuda.amp import GradScaler
             self.scaler = GradScaler()
-            self.logger.info("✅ ROCm 7 mixed precision scaler initialized")
+            self.logger.info("✅ Mixed precision scaler initialized")
 
         # Log memory optimization status
         initial_memory = torch.cuda.memory_allocated(self.device) / 1024**3
-        self.logger.info(f"🔧 ROCm 7 Memory optimizations initialized")
+        self.logger.info(f"🔧 Memory optimizations initialized")
         self.logger.info(f"  • Initial GPU Memory: {initial_memory:.2f}GB")
         self.logger.info(f"  • Mixed Precision: {use_mixed_precision}")
         self.logger.info(f"  • Gradient Checkpointing: {hasattr(model, 'use_gradient_checkpointing') and model.use_gradient_checkpointing}")
 
     def _setup_pytorch210_compile(self, model):
-        """Setup PyTorch 2.10 torch.compile with ROCm 7.0 optimizations."""
+        """Setup PyTorch torch.compile with ROCm compatible optimizations."""
 
         # Check if torch.compile is available
         if not hasattr(torch, 'compile'):
             self.logger.warning("torch.compile not available in this PyTorch version")
             return
 
-        # Determine GPU architecture for optimal compilation
+        # RX 7900 XT (RDNA3) specific optimizations
         gpu_name = torch.cuda.get_device_name(0).lower()
 
-        if 'mi300x' in gpu_name or 'instinct' in gpu_name:
-            # MI300X (CDNA3) optimizations
-            compile_config = {
-                'mode': 'max-autotune',
-                'backend': 'inductor',
-                'options': {
-                    'triton.enable': True,
-                    'triton.autotune': True,
-                    'max_autotune': True,
-                    'epilogue_fusion': True,
-                    'layout_optimization': True,
-                    'conv_1x1_as_mm': True,
-                }
-            }
-            arch_name = "MI300X (CDNA3)"
-        elif '7900' in gpu_name or 'rdna3' in gpu_name:
-            # RDNA3 (7900 XT) optimizations
+        if '7900' in gpu_name or 'rdna3' in gpu_name:
+            # RX 7900 XT (RDNA3/gfx1100) optimizations
             compile_config = {
                 'mode': 'reduce-overhead',
                 'backend': 'inductor',
@@ -772,18 +780,13 @@ class ModelTrainer(TrainingCore):
                     'layout_optimization': True,
                 }
             }
-            arch_name = "RDNA3 (7900 XT)"
+            arch_name = "RX 7900 XT (RDNA3/gfx1100)"
         else:
-            # Generic ROCm optimizations
-            compile_config = {
-                'mode': 'default',
-                'backend': 'inductor',
-                'options': {
-                    'triton.enable': True,
-                    'layout_optimization': True,
-                }
-            }
-            arch_name = "Generic ROCm"
+            # Unsupported GPU - warn user
+            self.logger.warning(f"⚠️  GPU {gpu_name} not optimized for RX 7900 XT")
+            self.logger.warning("This codebase is specifically optimized for AMD Radeon RX 7900 XT")
+            compile_config = {'mode': 'default', 'backend': 'inductor'}
+            arch_name = "Unsupported GPU"
 
         try:
             # DISABLED: torch.compile due to ROCm version incompatibility

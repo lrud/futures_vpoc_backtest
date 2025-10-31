@@ -6,6 +6,7 @@ Handles creating, transforming, and selecting features.
 
 import pandas as pd
 import numpy as np
+import torch
 from typing import List, Dict, Optional, Tuple
 import os
 from sklearn.preprocessing import StandardScaler
@@ -220,8 +221,10 @@ class FeatureEngineer:
                 if target_type == 'log':
                     # Log transformation to handle heteroskedasticity and make distribution more normal
                     df['target'] = np.log(1 + returns.shift(-1))
-                    df['target_transformed'] = 'log'
-                    self.logger.info("✅ Created log-transformed target variable")
+                    # CRITICAL FIX: Clip extreme target values to prevent gradient explosion
+                    df['target'] = df['target'].clip(-0.1, 0.1)  # Clip to ±10% returns
+                    df['target_transformed'] = 'log_clipped'
+                    self.logger.info("✅ Created log-transformed target variable with clipping")
                 elif target_type == 'winsorized':
                     # Winsorized target to reduce outlier impact
                     lower_1 = returns.quantile(0.01)
@@ -323,7 +326,6 @@ class FeatureEngineer:
 
         # Handle multi-GPU processing
         if device_ids and len(device_ids) > 1:
-            import torch
             from torch.utils.data import DataLoader, TensorDataset
 
             # Convert to tensors and distribute
@@ -332,14 +334,17 @@ class FeatureEngineer:
             # Create target variable using the enhanced robust target creation method
             features_df = self.create_robust_target(features_df, target_type='log')
 
-            # Return numpy arrays like the single GPU path for consistency
+            # CRITICAL FIX: Apply robust feature scaling before returning
             X = features_df[self.feature_columns].values
             y = features_df['target'].values
 
+            self.logger.info("🔧 Applying robust feature scaling to prevent gradient explosion...")
+            X_scaled = self.scale_features(X, fit=True)  # Apply our robust scaling method
+
             # Split into train/val
-            split_idx = int(len(X) * 0.8)
-            return (X[:split_idx], y[:split_idx],
-                   X[split_idx:], y[split_idx:],
+            split_idx = int(len(X_scaled) * 0.8)
+            return (X_scaled[:split_idx], y[:split_idx],
+                   X_scaled[split_idx:], y[split_idx:],
                    self.feature_columns)
         else:
             # Single GPU/CPU path - data loading already done above
@@ -375,10 +380,14 @@ class FeatureEngineer:
         # Split into features and target
         X = features_df[self.feature_columns].values
         y = features_df['target'].values
-        
+
+        # CRITICAL FIX: Apply robust feature scaling before returning
+        self.logger.info("🔧 Applying robust feature scaling to prevent gradient explosion...")
+        X_scaled = self.scale_features(X, fit=True)  # Apply our robust scaling method
+
         # Train/validation split (80/20)
-        split_idx = int(len(X) * 0.8)
-        return X[:split_idx], y[:split_idx], X[split_idx:], y[split_idx:], self.feature_columns
+        split_idx = int(len(X_scaled) * 0.8)
+        return X_scaled[:split_idx], y[:split_idx], X_scaled[split_idx:], y[split_idx:], self.feature_columns
 
     def generate_session_features(self, session_data: pd.DataFrame) -> Dict:
         """
@@ -588,28 +597,64 @@ class FeatureEngineer:
     
     def scale_features(self, X: np.ndarray, fit: bool = True) -> np.ndarray:
         """
-        Scale features using StandardScaler.
-        
+        Scale features using robust method with outlier handling.
+
         Parameters:
         -----------
         X: np.ndarray
             Feature matrix
         fit: bool
             Whether to fit the scaler or just transform
-            
+
         Returns:
         --------
         np.ndarray
             Scaled features
         """
         try:
+            # CRITICAL FIX: Apply robust scaling with outlier handling
             if fit:
-                return self.scaler.fit_transform(X)
+                # Check for extreme outliers before scaling
+                X_df = pd.DataFrame(X)
+                # CRITICAL FIX: Use numpy instead of deprecated pandas mad() method
+                median_vals = X_df.median()
+                mad_vals = (X_df - median_vals).abs().median()
+                outlier_mask = np.abs(X_df - median_vals) > 5 * mad_vals
+                outlier_count = outlier_mask.sum().sum()
+
+                if outlier_count > 0:
+                    self.logger.warning(f"⚠️  Detected {outlier_count} extreme outliers (>5 MAD) - applying robust scaling")
+
+                # Use robust scaling (median and MAD) instead of StandardScaler
+                from sklearn.preprocessing import RobustScaler
+                robust_scaler = RobustScaler(with_centering=True, with_scaling=True)
+                X_scaled = robust_scaler.fit_transform(X)
+
+                # Store the robust scaler for future use
+                self.scaler = robust_scaler
+
+                # Additional clipping for extreme values after scaling
+                X_scaled = np.clip(X_scaled, -10, 10)  # Clip to ±10 standard deviations
+
+                self.logger.info(f"✅ Applied robust scaling with clipping to {X_scaled.shape} features")
+                return X_scaled
             else:
-                return self.scaler.transform(X)
+                # Transform using existing scaler
+                X_scaled = self.scaler.transform(X)
+                # Apply clipping
+                X_scaled = np.clip(X_scaled, -10, 10)
+                return X_scaled
+
         except Exception as e:
-            self.logger.error(f"Feature scaling error: {e}")
-            return X
+            self.logger.error(f"Robust feature scaling error: {e}")
+            # Fallback to original scaling
+            try:
+                if fit:
+                    return self.scaler.fit_transform(X)
+                else:
+                    return self.scaler.transform(X)
+            except:
+                return X
 
     def prepare_features(self, raw_data: pd.DataFrame) -> pd.DataFrame:
         """

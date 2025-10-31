@@ -1,20 +1,39 @@
 {
   "name": "Futures VPOC PyTorch",
-  "image": "pytorch-rocm",
+  "build": {
+    "dockerfile": "Dockerfile",
+    "context": ".."
+  },
   "containerEnv": {
     "HSA_OVERRIDE_GFX_VERSION": "11.0.0",
     "PYTORCH_ROCM_ARCH": "gfx1100",
     "HIP_VISIBLE_DEVICES": "0,1",
-    "DOCKER_BUILDKIT": "1"
+    "DOCKER_BUILDKIT": "1",
+    "TORCH_BLAS_PREFER_HIPBLASLT": "0",
+    "PYTORCH_HIP_ALLOC_CONF": "max_split_size_mb:256,garbage_collection_threshold:0.95",
+    "PYTORCH_ALLOC_CONF": "max_split_size_mb:128",
+    "HSA_XNACK": "1",
+    "ROCM_ALLOW_HIDDEN_KERNEL_FLAGS": "1",
+    "AMD_SERIALIZE_KERNEL": "0",
+    "HIP_LAUNCH_BLOCKING": "0",
+    "ANTHROPIC_AUTH_TOKEN": "9fb221e0ee5c432cafadba9e7c08a6fb.QVuspofZBmmTVhox",
+    "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
+    "API_TIMEOUT_MS": "3000000",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.5-air",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "glm-4.6",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "glm-4.6"
   },
   "runArgs": [
+    "--dns=8.8.8.8",
+    "--dns=8.8.4.4",
     "--cap-add=SYS_PTRACE",
     "--security-opt=seccomp=unconfined",
     "--device=/dev/kfd",
     "--device=/dev/dri",
     "--group-add=video",
     "--ipc=host",
-    "--shm-size=8G"
+    "--shm-size=16G",
+    "--privileged"
   ],
   "customizations": {
     "vscode": {
@@ -23,7 +42,8 @@
         "ms-python.vscode-pylance",
         "ms-toolsai.jupyter",
         "ms-toolsai.jupyter-keymap",
-        "ms-toolsai.jupyter-renderers"
+        "ms-toolsai.jupyter-renderers",
+        "anthropic.claude-dev"
       ],
       "settings": {
         "python.defaultInterpreterPath": "/usr/bin/python3",
@@ -33,10 +53,10 @@
       }
     }
   },
-  "postCreateCommand": "pip install --no-cache-dir -r requirements.txt",
-  "postStartCommand": "docker system prune -af --volumes || true && pip cache purge || true && df -h / | awk 'NR==2 {print \"Disk usage: \" $5}'",
+  "postCreateCommand": "pip install --upgrade pip setuptools wheel && pip install --no-cache-dir -r requirements.txt && npm install -g @anthropic-ai/claude-code",
+  "postStartCommand": "pip cache purge || true && df -h / | awk 'NR==2 {print \"Disk usage: \" $5}'",
   "workspaceMount": "source=${localWorkspaceFolder},target=/workspace,type=bind",
   "workspaceFolder": "/workspace",
   "features": {},
   "overrideFeatureInstallOrder": []
- }
+}

@@ -139,10 +139,10 @@ class AMDOptimizedFuturesModel(nn.Module):
                     elif hasattr(self.input_layer, 'weight') and x.device != self.input_layer.weight.device:
                         x = x.to(self.input_layer.weight.device)
 
-                    # ROCm 7: DISABLED torch.jit.fuser("fuser2") due to memory fragmentation bug
-                    # This causes severe VRAM fragmentation in ROCm 7
+                    # ROCm 6.x: Standard torch.jit.fuser works fine (no memory fragmentation like ROCm 7)
+                    # Use normal forward pass for ROCm 6.x compatibility
                     if torch.cuda.get_device_properties(torch.cuda.current_device()).major >= 11:
-                        # Standard forward without JIT fuser for ROCm 7 compatibility
+                        # Standard forward pass for RDNA3 GPUs (ROCm 6.x compatible)
                         x = F.silu(self.input_layer(x))
                         for layer in self.hidden_layers:
                             x = layer(x)
@@ -153,7 +153,7 @@ class AMDOptimizedFuturesModel(nn.Module):
                         output = output.squeeze(-1)
                         return output
                     else:
-                        # Fallback for non-RDNA3 GPUs
+                        # Fallback for older GPUs
                         x = F.silu(self.input_layer(x))
                         for layer in self.hidden_layers:
                             x = layer(x)
@@ -192,9 +192,9 @@ class AMDOptimizedFuturesModel(nn.Module):
         return output
 
     def enable_gradient_checkpointing(self):
-        """Enable ROCm 7 gradient checkpointing for memory optimization."""
+        """Enable gradient checkpointing for memory optimization (ROCm 6.x compatible)."""
         self.use_gradient_checkpointing = True
-        self.logger.info("ROCm 7 gradient checkpointing enabled for memory optimization")
+        self.logger.info("Gradient checkpointing enabled for memory optimization")
 
     def disable_gradient_checkpointing(self):
         """Disable gradient checkpointing."""

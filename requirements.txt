@@ -1,6 +1,6 @@
 # Data Analysis
 pandas>=2.0.0
-numpy>=1.26.0
+numpy>=1.21.0,<2.0.0
 
 
 # Scientific Computing
@@ -36,6 +36,8 @@ anthropic>=0.18.0
 # Machine Learning (PyTorch ecosystem)
 # PyTorch is installed in Dockerfile with ROCm support
 scikit-learn>=1.3.0
+sympy>=1.13.3
+numba>=0.62.0
 
 
 # Optional: Distributed training (uncomment if needed)
