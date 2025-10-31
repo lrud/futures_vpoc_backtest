@@ -16,7 +16,7 @@
     "ROCM_ALLOW_HIDDEN_KERNEL_FLAGS": "1",
     "AMD_SERIALIZE_KERNEL": "0",
     "HIP_LAUNCH_BLOCKING": "0",
-    "ANTHROPIC_AUTH_TOKEN": "9fb221e0ee5c432cafadba9e7c08a6fb.QVuspofZBmmTVhox",
+    "ANTHROPIC_AUTH_TOKEN": "",
     "ANTHROPIC_BASE_URL": "https://api.z.ai/api/anthropic",
     "API_TIMEOUT_MS": "3000000",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "glm-4.5-air",
