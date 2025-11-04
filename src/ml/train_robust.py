@@ -33,7 +33,7 @@ warnings.filterwarnings('ignore')
 sys.path.append('/workspace')
 
 from src.ml.feature_engineering_robust import RobustFeatureEngineer
-from src.ml.model_robust import create_robust_model, create_robust_optimizer, HuberLoss
+from src.ml.model_robust import create_robust_model, create_robust_optimizer, BCELossWithLogits
 from src.utils.logging import get_logger
 from src.config.settings import settings
 
@@ -214,9 +214,14 @@ class RobustTrainer:
 
         self.model.to(self.device)
 
-        # Temporarily disable DataParallel to debug matrix dimension issue
-        if self.use_cuda:
-            logger.info(f"✅ Using single GPU: {self.device} (DataParallel temporarily disabled for debugging)")
+        # Enable multi-GPU training with DataParallel for maximum performance
+        if self.use_cuda and torch.cuda.device_count() > 1:
+            self.model = nn.DataParallel(self.model)
+            logger.info(f"✅ Using {torch.cuda.device_count()} GPUs for parallel training")
+            for i in range(torch.cuda.device_count()):
+                logger.info(f"  • GPU {i}: {torch.cuda.get_device_name(i)}")
+        elif self.use_cuda:
+            logger.info(f"✅ Using single GPU: {torch.cuda.get_device_name(0)}")
         else:
             logger.error("❌ GPU-only training required for robust pipeline")
             raise RuntimeError("Robust pipeline requires GPU support")
@@ -226,13 +231,16 @@ class RobustTrainer:
         logger.info(f"  • Input dim expected: {input_dim}")
         logger.info(f"  • First layer should be: Linear({input_dim}, {self.config.get('hidden_dims', [64, 32])[0]})")
 
-        # Create optimizer, warmup scheduler, and loss function
-        self.optimizer, self.warmup_scheduler, self.loss_fn = create_robust_optimizer(
+        # Create optimizer and warmup scheduler
+        self.optimizer, self.warmup_scheduler, _ = create_robust_optimizer(
             model=self.model,
             learning_rate=self.config.get('learning_rate', 1e-4),
             weight_decay=self.config.get('weight_decay', 1e-4),
             warmup_steps=self.config.get('warmup_steps', 1000)
         )
+
+        # Create BCE loss function for binary classification
+        self.loss_fn = BCELossWithLogits(pos_weight=1.0)
 
         # Create gradient scaler for mixed precision
         if self.use_amp:
@@ -464,8 +472,10 @@ class RobustTrainer:
         import json
         from datetime import datetime
 
-        # Create output directory
-        output_dir = self.config.get('output_dir', 'TRAINING_ROBUST')
+        # Create dated subfolder for organization
+        base_output_dir = self.config.get('output_dir', 'TRAINING')
+        date_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        output_dir = os.path.join(base_output_dir, f"training_{date_str}")
         os.makedirs(output_dir, exist_ok=True)
 
         # Save model state

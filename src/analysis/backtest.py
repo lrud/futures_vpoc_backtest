@@ -120,6 +120,14 @@ class BacktestEngine:
                     
                     # Calculate profit
                     profit = self._calculate_trade_profit(current_position, exit_price)
+
+                    # Ensure profit is a scalar to avoid pandas reindexing issues
+                    if hasattr(profit, 'iloc'):
+                        profit = profit.iloc[0] if len(profit) > 0 else profit
+                    elif hasattr(profit, 'item'):
+                        profit = profit.item()
+
+                    profit = float(profit)  # Convert to regular Python float
                     capital += profit
                     
                     # Log trade
@@ -144,10 +152,24 @@ class BacktestEngine:
             if not current_position:
                 # Calculate position size
                 position_size = self._calculate_position_size(entry_price, stop_loss, capital)
-                
-                # Validate position size
-                position_size = min(position_size, self.max_position_size)
-                
+
+                # Validate position size (handle pandas Series)
+                if hasattr(position_size, 'iloc'):  # It's a pandas Series
+                    position_size = position_size.clip(upper=self.max_position_size)
+                    # Extract scalar value if it's a Series with single element
+                    if len(position_size) == 1:
+                        position_size = position_size.iloc[0]
+                    else:
+                        # If multiple values, take the first one (shouldn't happen in normal operation)
+                        position_size = position_size.iloc[0]
+                else:
+                    position_size = min(position_size, self.max_position_size)
+
+                # Ensure position_size is a scalar integer
+                if hasattr(position_size, 'item'):
+                    position_size = position_size.item()
+                position_size = int(position_size)
+
                 # Check margin requirements
                 if self._check_margin_requirements(position_size, entry_price, capital):
                     current_position = {
@@ -188,15 +210,50 @@ class BacktestEngine:
         
         # Calculate risk per contract
         risk_per_contract = abs(entry_price - stop_loss)
-        
-        if risk_per_contract <= 0:
-            self.logger.warning("Invalid risk per contract (entry price = stop loss)")
-            return 1
+
+        # Handle pandas Series for risk comparison
+        if hasattr(risk_per_contract, 'iloc'):  # It's a pandas Series
+            if (risk_per_contract <= 0).any():
+                self.logger.warning("Invalid risk per contract (entry price = stop loss)")
+                return 1
+        else:
+            if risk_per_contract <= 0:
+                self.logger.warning("Invalid risk per contract (entry price = stop loss)")
+                return 1
         
         # Calculate position size
-        position_size = int(risk_amount / (risk_per_contract + self.slippage + self.commission))
-        
-        return max(1, position_size)  # Ensure at least 1 contract
+        if hasattr(risk_per_contract, 'iloc'):  # It's a pandas Series
+            # Handle division by zero and invalid values
+            denominator = risk_per_contract + self.slippage + self.commission
+            position_size = risk_amount / denominator
+
+            # Replace invalid values (inf, -inf, nan) with 1
+            position_size = position_size.fillna(1).replace([float('inf'), float('-inf')], 1)
+            position_size = position_size.astype(int)
+
+            # Ensure minimum 1 contract
+            position_size = position_size.clip(lower=1)
+
+            # If it's a Series with one element, extract scalar
+            if len(position_size) == 1:
+                return position_size.iloc[0]
+            else:
+                # Multiple values shouldn't happen in normal operation, but handle it
+                return position_size.iloc[0]
+        else:
+            # Handle scalar calculation
+            denominator = risk_per_contract + self.slippage + self.commission
+            if denominator == 0:
+                position_size = 1
+            else:
+                position_size = risk_amount / denominator
+
+                # Handle invalid values
+                if not np.isfinite(position_size) or position_size <= 0:
+                    position_size = 1
+
+            position_size = int(position_size)
+            return max(1, position_size)  # Ensure at least 1 contract
     
     def _simulate_exit_price(self, base_price, slippage, signal_type):
         """
@@ -216,49 +273,97 @@ class BacktestEngine:
     def _check_margin_requirements(self, position_size, price, capital):
         """
         Validate margin requirements for position.
-        
+
         Args:
             position_size: Number of contracts
             price: Contract price
             capital: Available capital
-            
+
         Returns:
             Boolean indicating if margin requirements are met
         """
+        # Convert all inputs to scalars to handle pandas Series
+        if hasattr(position_size, 'iloc'):
+            position_size = position_size.iloc[0] if len(position_size) > 0 else position_size
+        if hasattr(price, 'iloc'):
+            price = price.iloc[0] if len(price) > 0 else price
+        if hasattr(capital, 'iloc'):
+            capital = capital.iloc[0] if len(capital) > 0 else capital
+
+        # Handle numpy arrays
+        import numpy as np
+        if isinstance(position_size, np.ndarray):
+            position_size = float(position_size[0] if position_size.size > 0 else position_size)
+        if isinstance(price, np.ndarray):
+            price = float(price[0] if price.size > 0 else price)
+        if isinstance(capital, np.ndarray):
+            capital = float(capital[0] if capital.size > 0 else capital)
+
+        # Ensure all are scalars
+        position_size = float(position_size)
+        price = float(price)
+        capital = float(capital)
+
         margin_required = position_size * price * self.margin_requirement
         buffer_capital = capital * (1 - self.min_capital_buffer)
-        
+
         if margin_required > buffer_capital:
-            self.logger.warning(f"Margin requirement ({margin_required}) exceeds available capital with buffer ({buffer_capital})")
+            self.logger.warning(f"Margin requirement ({margin_required:.2f}) exceeds available capital with buffer ({buffer_capital:.2f})")
             return False
-            
+
         return True
     
     def _calculate_trade_profit(self, position, exit_price):
         """
         Calculate realistic profit including all costs.
-        
+
         Args:
             position: Position dictionary
             exit_price: Exit price
-            
+
         Returns:
             Net profit
         """
+        # Extract scalar values from position to avoid pandas Series issues
+        entry_price = position['entry_price']
+        position_size = position['position_size']
+
+        # Ensure exit_price is scalar
+        if hasattr(exit_price, 'iloc'):
+            exit_price = exit_price.iloc[0] if len(exit_price) > 0 else exit_price
+        elif hasattr(exit_price, 'item'):
+            exit_price = exit_price.item()
+
+        # Ensure position values are scalars
+        if hasattr(entry_price, 'iloc'):
+            entry_price = entry_price.iloc[0] if len(entry_price) > 0 else entry_price
+        elif hasattr(entry_price, 'item'):
+            entry_price = entry_price.item()
+
+        if hasattr(position_size, 'iloc'):
+            position_size = position_size.iloc[0] if len(position_size) > 0 else position_size
+        elif hasattr(position_size, 'item'):
+            position_size = position_size.item()
+
+        # Convert to regular Python floats
+        exit_price = float(exit_price)
+        entry_price = float(entry_price)
+        position_size = float(position_size)
+
         # Calculate gross profit
         if position['type'] == 'LONG':
-            gross_profit = (exit_price - position['entry_price']) * position['position_size']
+            gross_profit = (exit_price - entry_price) * position_size
         else:  # SHORT
-            gross_profit = (position['entry_price'] - exit_price) * position['position_size']
-        
+            gross_profit = (entry_price - exit_price) * position_size
+
         # Enhanced cost calculation
         total_commission = self.commission * 2  # Entry and exit
-        exchange_fees = 2.50 * position['position_size'] * 2  # $2.50 per contract per side
-        clearing_fees = 0.50 * position['position_size'] * 2  # $0.50 per contract per side
-        
+        exchange_fees = 2.50 * position_size * 2  # $2.50 per contract per side
+        clearing_fees = 0.50 * position_size * 2  # $0.50 per contract per side
+
         # Calculate net profit
         net_profit = gross_profit - (total_commission + exchange_fees + clearing_fees)
-        
+
         return net_profit
     
     def _calculate_metrics(self):

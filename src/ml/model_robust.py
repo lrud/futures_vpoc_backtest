@@ -21,51 +21,39 @@ from src.utils.logging import get_logger
 
 logger = get_logger(__name__)
 
-class HuberLoss(nn.Module):
+class BCELossWithLogits(nn.Module):
     """
-    Huber Loss implementation for robust training.
+    Binary Cross Entropy Loss with Logits for binary classification.
 
-    Combines MSE loss for small errors with MAE loss for large errors.
-    This provides robustness to outliers while maintaining efficiency for normal samples.
-
-    Formula:
-      loss = 0.5 * (error)^2 for |error| <= delta
-      loss = delta * (|error| - 0.5 * delta) for |error| > delta
+    Suitable for directional trading targets (UP=1, DOWN=0).
+    More numerically stable than using Sigmoid + BCE separately.
     """
 
-    def __init__(self, delta: float = 1.0):
+    def __init__(self, pos_weight: float = 1.0):
         """
-        Initialize Huber Loss.
+        Initialize BCE Loss with logits.
 
         Args:
-            delta: Threshold where quadratic loss transitions to linear loss
-                   Smaller delta = more robust to outliers
-                   Recommended for financial data: 0.1 - 1.0
+            pos_weight: Weight for positive class (helps with class imbalance)
         """
         super().__init__()
-        self.delta = delta
-        logger.info(f"🛡️ Initialized Huber Loss with delta={delta}")
+        self.pos_weight = pos_weight
+        self.bce_loss = nn.BCEWithLogitsLoss(pos_weight=torch.tensor(pos_weight))
+        logger.info(f"🎯 Initialized BCE Loss with logits for binary classification")
+        logger.info(f"  • Positive class weight: {pos_weight}")
 
     def forward(self, predictions: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
         """
-        Compute Huber loss.
+        Compute binary cross entropy loss.
 
         Args:
-            predictions: Model predictions (batch_size, 1)
-            targets: Target values (batch_size, 1)
+            predictions: Model logits (batch_size, 1) - before sigmoid
+            targets: Target labels (batch_size, 1) - 0 or 1
 
         Returns:
-            Huber loss tensor
+            BCE loss tensor
         """
-        error = predictions - targets
-        abs_error = torch.abs(error)
-
-        # Quadratic loss for small errors, linear for large errors
-        quadratic_loss = torch.where(abs_error <= self.delta,
-                                     0.5 * error ** 2,
-                                     self.delta * (abs_error - 0.5 * self.delta))
-
-        return quadratic_loss.mean()
+        return self.bce_loss(predictions.squeeze(), targets.float().squeeze())
 
 class ResidualBlock(nn.Module):
     """
@@ -150,8 +138,8 @@ class RobustFinancialNet(nn.Module):
     5. ROCm 7 consumer GPU optimization
     """
 
-    def __init__(self, input_dim: int = 5, hidden_dims: list = [64, 32],
-                 dropout_rate: float = 0.1, use_residual: bool = True):
+    def __init__(self, input_dim: int = 10, hidden_dims: list = [128, 64, 32, 16],
+                 dropout_rate: float = 0.3, use_residual: bool = True):
         """
         Initialize robust financial neural network.
 
@@ -192,7 +180,8 @@ class RobustFinancialNet(nn.Module):
             ])
             prev_dim = hidden_dim
 
-        # Output layer (regression to predict rank-transformed target)
+        # Output layer (binary classification for directional target)
+        # Note: No sigmoid here - BCEWithLogitsLoss includes it
         layers.append(nn.Linear(prev_dim, 1))
 
         self.network = nn.Sequential(*layers)
@@ -379,12 +368,12 @@ def create_robust_optimizer(model: RobustFinancialNet, learning_rate: float = 1e
         target_lr=learning_rate
     )
 
-    # Create Huber loss (delta=0.1 is good for rank-transformed targets)
-    loss_fn = HuberLoss(delta=0.1)
+    # Note: HuberLoss removed for binary classification - use BCELossWithLogits instead
+    loss_fn = None  # Will be created by caller
 
     logger.info(f"✅ Created AdamW optimizer with lr={learning_rate}, weight_decay={weight_decay}")
     logger.info(f"✅ Created {warmup_steps}-step learning rate warmup")
-    logger.info(f"✅ Created Huber loss with delta=0.1")
+    logger.info(f"✅ Optimizer ready for binary classification")
 
     return optimizer, warmup_scheduler, loss_fn
 
